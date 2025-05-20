@@ -1,0 +1,4512 @@
+# ===================================
+
+## ARCHIVO: __init__.py
+## ==================================================
+
+
+
+import path_setup  # Carga las rutas definidas
+
+__version__ = "0.1.0"
+
+
+
+
+
+## ARCHIVO: core/__init__.py
+## ==================================================
+
+
+
+
+## ARCHIVO: core/learning/__init__.py
+## ==================================================
+
+"""
+Entornos y componentes de aprendizaje por refuerzo
+"""
+
+from .environment import NetEnv  # La misma exportación para mantener compatibilidad
+
+
+
+
+
+## ARCHIVO: core/learning/encoder.py
+## ==================================================
+
+import torch
+import torch.nn as nn
+import gymnasium as gym 
+
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+# ------------------------------------------------------------------
+# Utilidades
+# ------------------------------------------------------------------
+class _FourierEncoding(nn.Module):
+    """Devuelve [x, sin(2^k πx), cos(2^k πx)] para k < num_bands."""
+    def __init__(self, num_bands: int = 4):
+        super().__init__()
+        self.register_buffer("freq_bands", 2 ** torch.arange(num_bands).float() * torch.pi)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Expande cada característica con pares seno/coseno a distintas
+        frecuencias, preservando la forma (*batch*, features).
+        """
+        enc = [x]
+        for f in self.freq_bands:          # type: ignore[attr-defined]
+            enc.append(torch.sin(f * x))
+            enc.append(torch.cos(f * x))
+        return torch.cat(enc, dim=-1)
+
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim: int, p: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.SiLU(),
+            nn.Dropout(p),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+# ------------------------------------------------------------------
+# Extractores
+# ------------------------------------------------------------------
+
+class SimpleExtractor(BaseFeaturesExtractor):
+    """MLP de referencia (64 dims)."""
+    def __init__(self, observation_space: gym.spaces.Box):
+        super().__init__(observation_space, features_dim=64)
+        inp = observation_space.shape[0]
+        self.network = nn.Sequential(
+            nn.Linear(inp, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, 64),
+        )
+
+    def forward(self, obs: torch.Tensor):
+        return self.network(obs)
+
+
+class AdvancedExtractor(BaseFeaturesExtractor):
+    """
+    · Codificación de Fourier (4 bandas) → 36 dims<br>
+    · Proyección a 128 + 2 bloques residuales + LayerNorm/SiLU<br>
+    Devuelve un vector de 128 dims.
+    """
+    def __init__(self, observation_space: gym.spaces.Box, num_bands: int = 4):
+        super().__init__(observation_space, features_dim=128)
+        self.encode = _FourierEncoding(num_bands)
+        self.project = nn.Linear((1 + 2 * num_bands) * observation_space.shape[0], 128)
+        self.blocks = nn.Sequential(
+            _ResidualBlock(128), _ResidualBlock(128),
+            nn.LayerNorm(128), nn.SiLU(),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = self.encode(obs)
+        x = self.project(x)
+        return self.blocks(x)
+
+
+# ✔ Hacemos que el entrenamiento utilice el extractor avanzado por defecto.
+FeaturesExtractor = AdvancedExtractor
+
+
+
+## ARCHIVO: core/learning/env_actions.py
+## ==================================================
+
+import math
+import logging
+from typing import Dict, List, Tuple, Any, Optional
+
+import numpy as np
+from core.network.operation import Operation
+from core.network.net import Net
+
+from core.learning.env_utils import SchedulingError, ErrorType, find_next_event_time, check_temp_operations
+
+# --------------------------------------------------------------------------- #
+# → NUEVA filosofía de GCL ←                                                 #
+#   ▸ Cada vez que un hop *espera* en el egress-switch                       #
+#     se añaden **exactamente 2 entradas** (close n).                   #
+#   ▸ La longitud del ciclo no cambia (se mantiene en 1 para indicar que     #
+#     gestionaremos las reglas como eventos independientes).                 #
+# --------------------------------------------------------------------------- #
+
+# Todas las utilidades relacionadas con la reserva dinámica de GCL se han
+# eliminado.  A partir de ahora la lista se calcula *a posteriori* en el
+# analizador de resultados.
+
+pass  # <-- mantener el archivo, sin lógica de GCL
+
+# --------------------------------------------------------------------------- #
+# Funciones para la implementación del método step                            #
+# --------------------------------------------------------------------------- #
+def process_step_action(self, action):
+    """Procesa la acción en el método step"""
+    # -------------------------------------------------------------- #
+    # 0. Interpretar la acción con componentes reducidos              #
+    # -------------------------------------------------------------- #
+    # La acción ahora es un array con 3 componentes
+    guard_factor_idx  = int(action[0])
+    switch_gap_idx    = int(action[1])
+    flow_selection    = int(action[2])
+    
+    # Convertir índices en valores reales para usar en el algoritmo
+    offset_us = 0
+    guard_factor_values = [0.5, 0.75, 1.0, 1.5, 2.0]
+    guard_factor = guard_factor_values[guard_factor_idx]
+    switch_gap_values = [0.5, 1.0, 1.5, 2.0]
+    switch_gap = switch_gap_values[switch_gap_idx]
+    
+    # Registrar las decisiones del agente para visualización
+    flow = self.current_flow()
+    
+    # Almacenar todas las decisiones del agente (sin gcl_strategy)
+    self.agent_decisions = {
+        'guard_factor': guard_factor,
+        'switch_gap': switch_gap,
+        'flow_selection': flow_selection
+    }
+    
+    # NUEVO: Métricas de operación para el análisis
+    self.last_operation_info = {
+        'bandwidth_used': 0,
+        'bandwidth_total': 0,
+        'wait_breakdown': {
+            'switch': 0,
+            'gap': 0,
+            'total': 0
+        }
+    }
+
+    flow = self.current_flow()
+    hop_idx = self.flow_progress[self.current_flow_idx]
+    link = self.link_dict[flow.path[hop_idx]]
+    gating = True
+    trans_time = link.transmission_time(flow.payload)
+    
+    # Guard time ahora usa el factor elegido por el agente
+    base_guard_time = link.interference_time()
+    guard_time = base_guard_time * guard_factor
+    
+    # Registrar las decisiones del agente para visualización posterior
+    self.guard_time_selected = guard_time
+    self.switch_gap_selected = switch_gap
+
+    # Si el ORIGEN del enlace es un switch ⇒ este hop ES un egress
+    def _get_src(node_pair):
+        return node_pair[0] if isinstance(node_pair, tuple) \
+               else node_pair.split('-')[0]
+
+    sw_src = _get_src(link.link_id)
+    is_egress_from_switch = sw_src.startswith('S') and not sw_src.startswith('SRV')
+    
+    # Use fixed conservative GCL strategy
+    gcl_strategy = 0
+    
+    return (flow, hop_idx, link, gating, trans_time,
+            guard_time, guard_factor,               # ➊  NUEVO
+            offset_us, switch_gap, sw_src,
+            is_egress_from_switch, gcl_strategy)
+
+
+
+## ARCHIVO: core/learning/env_utils.py
+## ==================================================
+
+import math
+import os
+import random
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, List, Dict, Any
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+from core.network.operation import Operation, check_operation_isolation
+from core.network.net import Net, Network, generate_flows, generate_simple_topology, FlowGenerator, UniDirectionalFlowGenerator
+
+# --------------------------------------------------------------------------- #
+#  Definiciones de error                                                      #
+# --------------------------------------------------------------------------- #
+class ErrorType(Enum):
+    PeriodExceed = auto()
+
+class SchedulingError(Exception):
+    def __init__(self, error_type: ErrorType, msg: str):
+        super().__init__(f"Error: {msg}")
+        self.error_type = error_type
+        self.msg = msg
+
+# Funciones auxiliares para NetEnv
+def find_next_event_time(link_busy_until, switch_busy_until, current_time):
+    """Encuentra el siguiente tiempo de evento programado después de current_time"""
+    next_event_time = float('inf')
+    
+    # Buscar en todos los tiempos de ocupación de enlaces
+    for time in link_busy_until.values():
+        if time > current_time and time < next_event_time:
+            next_event_time = time
+            
+    # Buscar en todos los tiempos de ocupación de switches
+    for time in switch_busy_until.values():
+        if time > current_time and time < next_event_time:
+            next_event_time = time
+    
+    return next_event_time if next_event_time < float('inf') else None
+
+def check_valid_link(link, operation, current_flow, links_operations):
+    """Comprueba si una operación es válida en un enlace"""
+    for f_rhs, op_rhs in links_operations[link]:
+        offset = check_operation_isolation(
+            (operation, current_flow.period), (op_rhs, f_rhs.period)
+        )
+        if offset is not None:
+            return offset
+    return None
+
+def check_temp_operations(temp_operations, links_operations, current_flow):
+    """Verifica todas las operaciones temporales"""
+    for link, op in temp_operations:
+        offset = check_valid_link(link, op, current_flow, links_operations)
+        if offset is not None:
+            return offset
+    return None
+
+
+
+## ARCHIVO: core/learning/environment.py
+## ==================================================
+
+import math
+import os
+import random
+import logging
+from collections import defaultdict
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Optional, List, Dict, Any
+
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+
+from tools.definitions import LOG_DIR
+from core.network.operation import Operation, check_operation_isolation
+from core.network.net import Net, Network, generate_flows, generate_simple_topology, FlowGenerator, UniDirectionalFlowGenerator
+
+# Importar desde los módulos auxiliares
+from core.learning.env_utils import ErrorType, SchedulingError, find_next_event_time
+from core.learning.env_utils import check_valid_link, check_temp_operations
+from core.learning.env_actions import process_step_action
+
+# --------------------------------------------------------------------------- #
+#  Entorno TSN / DRL                                                          #
+# --------------------------------------------------------------------------- #
+class NetEnv(gym.Env):
+    """Entorno de simulación TSN para aprendizaje por refuerzo."""
+    
+    # Usar la constante centralizada en Net
+    MIN_SWITCH_GAP = Net.SWITCH_GAP_MIN
+
+    @dataclass
+    class GclInfo:
+        gcl_cycle: int = 1
+        gcl_length: int = 0
+
+    # --------------------------------------------------------------------- #
+    #  Inicialización                                                       #
+    # --------------------------------------------------------------------- #
+    def __init__(self, network: Optional[Network] = None, 
+                curriculum_enabled: bool = True,
+                initial_complexity: float = 0.25,
+                curriculum_step: float = 0.05) -> None:
+        super().__init__()
+
+        # --- Curriculum Learning Adaptativo ---
+        self.curriculum_enabled = curriculum_enabled
+        self.initial_complexity = initial_complexity 
+        self.curriculum_step = curriculum_step
+        self.current_complexity = initial_complexity
+        self.consecutive_successes = 0
+        self.original_flows = []  # Store the original complete set of flows
+        
+        # Si se proporciona una red, guardar su estructura original
+        if network is not None:
+            self.total_flows = len(network.flows)
+            self.base_graph = network.graph
+            # Guardar todos los flujos originales
+            self.original_flows = list(network.flows)
+            
+            # Registro explícito para depuración del modo curriculum
+            self.logger = logging.getLogger(f"{__name__}.{os.getpid()}")
+            self.logger.setLevel(logging.INFO)
+            self.logger.info(f"Inicializando entorno con {self.total_flows} flujos (curriculum: {curriculum_enabled}, complejidad inicial: {initial_complexity})")
+            
+            if curriculum_enabled and initial_complexity < 1.0:
+                # En modo curriculum, reducir el número inicial de flujos
+                active_flows = int(self.total_flows * self.initial_complexity)
+                active_flows = max(5, active_flows)  # Mínimo 5 flujos para empezar
+                
+                # Seleccionar subset de flujos para el nivel de complejidad actual
+                active_flows_list = self.original_flows[:active_flows]
+                network = Network(network.graph, active_flows_list)
+                self.logger.info(f"Modo curriculum ACTIVADO: usando {active_flows}/{self.total_flows} flujos inicialmente")
+            else:
+                # Si curriculum está desactivado o complejidad es 1.0, usar todos los flujos
+                self.logger.info(f"Modo curriculum DESACTIVADO: usando todos los {self.total_flows} flujos")
+                self.current_complexity = 1.0  # Forzar complejidad completa
+        
+        # Si no se entrega una red, construir topología y flujos sencillos
+        if network is None:
+            g = generate_simple_topology()
+            f = generate_flows(g, 10)
+            network = Network(g, f)
+            self.total_flows = len(network.flows)
+            self.base_graph = g
+            # Crear generador de flujos apropiado
+            self.flow_generator = FlowGenerator(g)
+
+        # --- Estructuras base -------------------------------------------- #
+        self.graph = network.graph
+        self.flows = list(network.flows)               # lista estable
+        self.line_graph, self.link_dict = (
+            network.line_graph,
+            network.links_dict,
+        )
+
+        # --- Estados internos ------------------------------------------- #
+        self.num_flows: int = len(self.flows)
+        # Reloj de referencia global (solo para la observación)
+        # Se calcula siempre como el próximo evento más cercano
+        self.global_time: int = 0
+        self.flow_progress: List[int] = [0] * self.num_flows  # hop en curso de cada flujo
+        self.flow_completed: List[bool] = [False] * self.num_flows
+        self.flow_first_tx: List[int | None] = [None] * self.num_flows
+        self.current_flow_idx: int = 0                 # para round‑robin
+
+        self.links_operations = defaultdict(list)
+
+        #  🔀  Las estructuras ligadas a GCL ya no se utilizan.  Mantener
+        #  únicamente la planificación de operaciones; el cálculo de las
+        #  tablas se traslada al *ResAnalyzer*.
+
+        self.temp_operations: List[tuple] = []         # op en construcción
+
+        # 🔹 Placeholder para mantener compatibilidad con código heredado.
+        #   Ya no se llena ni se usa, pero evita AttributeError.
+        self.links_gcl: dict = {}
+
+        # ⏱️  NUEVO: reloj "ocupado‑hasta" por enlace
+        #    (cuándo queda libre cada enlace)
+        self.link_busy_until = defaultdict(int)
+        # ⏱️⏱️ reloj "ocupado‑hasta" por switch **sólo para EGRESOS**
+        self.switch_busy_until = defaultdict(int)
+        
+        # 📊 NUEVO: Registro del último tiempo de llegada por switch
+        # Para garantizar separación mínima entre paquetes
+        self.switch_last_arrival = defaultdict(int)
+
+        # ⏲️  Último instante en que **se creó** (primer hop) un paquete
+        #     – solo se usa para imponer la separación en el PRIMER enlace
+        self.last_packet_start = -Net.PACKET_GAP_EXTRA
+
+        # 🚦 NUEVO: sección crítica global – "una sola cola"
+        self.global_queue_busy_until = 0
+
+        # --- Espacios de observación y acción --------------------------- #
+        self._setup_spaces()
+
+        # --- Logger ------------------------------------------------------ #
+        self.logger = logging.getLogger(f"{__name__}.{os.getpid()}")
+        self.logger.setLevel(logging.INFO)
+
+        # Cache: «¿es nodo final?»
+        self._es_node_cache: Dict[Any, bool] = {}
+        
+        # Variable para datos de operación
+        self.last_operation_info = {}
+        self.agent_decisions = {}
+
+        # Orden FIFO inmutable: simplemente el índice de creación del flujo
+        # (flows ya está en el mismo orden en que se generaron).
+        self._fifo_order = list(range(self.num_flows))
+
+    # ----------------------------------------------------------------- #
+    #  Helper estático (picklable) para muestrear la separación global  #
+    # ----------------------------------------------------------------- #
+    @staticmethod
+    def _next_packet_gap() -> int:
+        """
+        Devuelve la separación entre paquetes (µs) delegando la lógica
+        íntegramente a ``Net.sample_packet_gap``.  
+        Esta versión elimina código muerto y evita ramas nunca alcanzadas.
+        """
+        return Net.sample_packet_gap()
+
+    # --------------------------------------------------------------------- #
+    #  Configuración de gymnasium                                           #
+    # --------------------------------------------------------------------- #
+    def _default_gcl_info(self):
+        return self.GclInfo()
+
+    def _setup_spaces(self):
+        # MODIFICAR LA OBSERVACIÓN: Incluir información de múltiples flujos (hasta 5)
+        # Para cada flujo: [período_norm, payload_norm, progreso, tiempo_espera_norm, es_seleccionable]
+        # Además de las características globales originales
+        FLUJOS_OBSERVABLES = 5  # Número de flujos que podemos observar a la vez
+        FEATURES_POR_FLUJO = 5  # Características por flujo
+        FEATURES_GLOBALES = 4   # Características globales (tiempo, ocupación GCL, etc.)
+        
+        self.observation_space = spaces.Box(
+            low=0.0, 
+            high=1.0, 
+            shape=(FEATURES_GLOBALES + FLUJOS_OBSERVABLES * FEATURES_POR_FLUJO,), 
+            dtype=np.float32
+        )
+        
+        # NUEVO: Almacenar constantes para uso posterior
+        self.NUM_FLUJOS_OBSERVABLES = FLUJOS_OBSERVABLES
+        self.FEATURES_POR_FLUJO = FEATURES_POR_FLUJO
+        self.FEATURES_GLOBALES = FEATURES_GLOBALES
+
+        # ╔═══════════════════════════════════════════════════════════════════════╗
+        # ║  ESPACIO DE ACCIÓN (3 DIMENSIONES)                                    ║
+        # ║  0. Guard factor [0-4]                                                ║
+        # ║  1. Gap mínimo en switch [0-3]                                        ║
+        # ║  2. Selección de flujo candidato [0-4]                                ║
+        # ╚═══════════════════════════════════════════════════════════════════════╝
+        self.action_space = spaces.MultiDiscrete([
+            5,                 # Guard factor
+            4,                 # Gap mínimo switch
+            FLUJOS_OBSERVABLES # Selección de flujo
+        ])
+
+    # --------------------------------------------------------------------- #
+    #  Utilidades de selección de flujo / enlace                            #
+    # --------------------------------------------------------------------- #
+    def select_next_flow_by_agent(self, flow_selection):
+        """
+        Permite que el agente RL seleccione el próximo flujo a programar.
+        
+        Args:
+            flow_selection: Índice del flujo seleccionado por el agente (0-4)
+        """
+        # Usar el índice de flujo seleccionado por el agente si está disponible
+        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
+            if 0 <= flow_selection < len(self.current_candidate_flows):
+                selected_idx = self.current_candidate_flows[flow_selection]
+                if not self.flow_completed[selected_idx]:
+                    self.current_flow_idx = selected_idx
+                    return
+
+        # Si la selección directa falla, usar FIFO como fallback
+        now = self.global_time
+        chosen = None  # (idx, wait_time)
+
+        for idx, done in enumerate(self.flow_completed):
+            if done:
+                continue
+            prog = self.flow_progress[idx]
+            if prog == 0 or prog >= len(self.flows[idx].path):
+                continue
+            next_link = self.flows[idx].path[prog]
+            if not next_link[0].startswith('S'):
+                continue
+
+            prev_link_id = self.flows[idx].path[prog-1]
+            prev_ops = self.links_operations[self.link_dict[prev_link_id]]
+            if not prev_ops:
+                continue  # el hop previo aún no fue programado
+            prev_op = prev_ops[-1][1]
+            wait_time = now - prev_op.reception_time
+            if chosen is None or wait_time > chosen[1]:
+                chosen = (idx, wait_time)
+
+        if chosen:
+            self.current_flow_idx = chosen[0]
+            return
+                
+        # Si no se encontró un flujo adecuado, buscar cualquier flujo no completado
+        if self.flow_completed[self.current_flow_idx]:
+            for idx, completed in enumerate(self.flow_completed):
+                if not completed:
+                    self.current_flow_idx = idx
+                    return
+
+    def current_flow(self):
+        return self.flows[self.current_flow_idx]
+
+    def current_link(self):
+        idx = self.flow_progress[self.current_flow_idx]
+        flow = self.current_flow()
+        return self.link_dict[flow.path[idx]]
+
+    # ----------------------------------------------------------------- #
+    #  FIFO helper                                                      #
+    # ----------------------------------------------------------------- #
+    def _next_fifo_idx(self) -> int | None:
+        """
+        Devuelve el índice del **único** flujo que debe programarse ahora
+        según FIFO estricto (el que más tiempo lleva esperando).
+        Si no hay flujos pendientes, devuelve None.
+        
+        Prioridad: 
+        1. Paquetes que están esperando en un switch (para transmisión inmediata)
+        2. Paquetes con mayor tiempo de espera
+        """
+        best: tuple[int, int, bool, int] | None = None   # (wait_time, -idx, is_in_switch, hop_idx)
+        best_idx: int | None = None
+
+        now = self.global_time
+        for idx, done in enumerate(self.flow_completed):
+            if done:
+                continue
+            hop_idx = self.flow_progress[idx]
+            if hop_idx >= len(self.flows[idx].path):
+                continue
+
+            # --- tiempo desde que el paquete está "listo" ---
+            if hop_idx == 0:
+                ready_t = 0                          # nunca se ha transmitido
+                is_in_switch = False
+            else:
+                prev_link_id = self.flows[idx].path[hop_idx - 1]
+                prev_ops = self.links_operations.get(self.link_dict[prev_link_id], [])
+                if not prev_ops:
+                    continue        # hop previo aún no programado ⇒ no listo
+                
+                prev_op = prev_ops[-1][1]
+                ready_t = prev_op.reception_time
+                
+                # Determinar si el paquete está esperando en un switch
+                # Si el destino del enlace anterior es un switch y el origen del siguiente enlace
+                # coincide con ese switch, entonces el paquete está esperando en un switch
+                dst_node = prev_link_id[1] if isinstance(prev_link_id, tuple) else prev_link_id.split('-')[1]
+                is_in_switch = dst_node.startswith('S') and not dst_node.startswith('SRV')
+
+            wait = now - ready_t
+            fifo_rank = -idx               # menor índice ⇒ más antiguo
+            
+            # Prioridad: 1) paquetes en switch, 2) tiempo de espera, 3) índice más bajo
+            cand = (int(is_in_switch), wait, fifo_rank, hop_idx)
+
+            if (best is None) or (cand > best):
+                best = cand
+                best_idx = idx
+
+        return best_idx
+
+    # --------------------------------------------------------------------- #
+    #  Reinicio                                                             #
+    # --------------------------------------------------------------------- #
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        
+        # Si es necesario incrementar la complejidad
+        if self.curriculum_enabled and self.consecutive_successes >= 3:
+            if self.increase_complexity():
+                # Calcular número de flujos según complejidad actual
+                num_flows = int(self.total_flows * self.current_complexity)
+                num_flows = max(5, min(self.total_flows, num_flows))
+                
+                if self.original_flows:
+                    # Usar un subset consistente de los flujos originales
+                    active_flows_list = self.original_flows[:num_flows]
+                    network = Network(self.base_graph, active_flows_list)
+                    
+                    # Actualizar las estructuras con la nueva red
+                    self.graph = network.graph
+                    self.flows = list(network.flows)
+                    self.line_graph, self.link_dict = (
+                        network.line_graph,
+                        network.links_dict,
+                    )
+                    self.num_flows = len(self.flows)
+                    
+                    self.logger.info(f"Curriculum: Incrementando a {num_flows}/{self.total_flows} flujos (complejidad: {self.current_complexity:.2f})")
+                
+            self.consecutive_successes = 0
+
+        self.global_time = 0
+        self.flow_progress = [0] * self.num_flows
+        self.flow_completed = [False] * self.num_flows
+        self.flow_first_tx = [None] * self.num_flows
+        self.current_flow_idx = 0
+
+        self.links_operations.clear()
+        self.links_gcl = {}   # reiniciar placeholder
+        self.temp_operations.clear()
+        self._es_node_cache.clear()
+        self.link_busy_until.clear()
+        self.switch_busy_until.clear()
+        self.switch_last_arrival.clear()    # NUEVO: Limpiar tiempos de llegada
+        self.global_queue_busy_until = 0
+        self.last_packet_start = -Net.PACKET_GAP_EXTRA
+                                           
+        return self._get_observation(), {}
+
+    # --------------------------------------------------------------------- #
+    #  Observación                                                          #
+    # --------------------------------------------------------------------- #
+    def _get_observation(self):
+        # Creamos una observación que contenga información sobre múltiples flujos
+        # La observación tendrá: [características_globales, características_flujo1, características_flujo2, ...]
+        
+        # 1. Características globales de la red
+        global_time_norm = self.global_time / 10000  # Normalizar tiempo global
+        
+        # Ya no hay GCL dinámico → utilización 0 siempre
+        gcl_util_norm = 0.0
+        
+        # Calcular porcentaje de flujos completados
+        completion_rate = sum(self.flow_completed) / self.num_flows
+        
+        # Nivel de curriculum
+        curriculum_norm = self.current_complexity
+        
+        # Vector de características globales
+        global_features = [global_time_norm, gcl_util_norm, completion_rate, curriculum_norm]
+        
+        # 2. Obtener una lista de flujos candidatos para programar
+        candidatos = []
+        for idx, completed in enumerate(self.flow_completed):
+            if not completed:
+                flow = self.flows[idx]
+                hop_idx = self.flow_progress[idx]
+                
+                # Verificar que el flujo tiene un hop válido para programar
+                if hop_idx >= len(flow.path):
+                    continue
+                    
+                # Calcular cuánto tiempo ha estado esperando (si aplica)
+                wait_time = 0
+                if hop_idx > 0:
+                    prev_link_id = flow.path[hop_idx-1]
+                    prev_ops = self.links_operations.get(self.link_dict[prev_link_id], [])
+                    if prev_ops:
+                        prev_op = prev_ops[-1][1]
+                        wait_time = max(0, self.global_time - prev_op.reception_time)
+                
+                # Normalizar valores - convertir a características significativas 
+                period_norm = flow.period / 10000  # Períodos más cortos → valores más pequeños
+                payload_norm = flow.payload / Net.MTU  # Payloads más pequeños → valores más pequeños
+                hop_progress = self.flow_progress[idx] / len(flow.path)
+                wait_time_norm = min(wait_time / flow.period, 1.0)  # Normalizar por periodo
+                
+                # Calcular urgencia basada en plazo próximo
+                # Cuanto menor sea el tiempo hasta el deadline, mayor urgencia (1.0 = muy urgente)
+                deadline_remaining = (flow.period - (self.global_time % flow.period)) / flow.period
+                urgency = 1.0 - deadline_remaining  # 0.0 = acaba de empezar, 1.0 = casi vencido
+                
+                # Log del flujo candidato con sus características para depuración
+                self.logger.debug(f"Candidato: {flow.flow_id}, Period: {period_norm:.2f}, Payload: {payload_norm:.2f}, Wait: {wait_time_norm:.2f}, Urgency: {urgency:.2f}")
+                
+                # Añadir a candidatos con sus características
+                candidatos.append((idx, [period_norm, payload_norm, hop_progress, wait_time_norm, urgency]))
+        
+        # 3. Si no hay candidatos, devolver una observación con ceros
+        if not candidatos:
+            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        
+        # 4. Ordenar candidatos de forma significativa para el agente
+        # Considerar múltiples factores: tiempo espera (FIFO), urgencia, tamaño payload
+        candidatos = sorted(candidatos, key=lambda x: (
+            x[1][3],  # Tiempo de espera (mayor primero - FIFO)
+            x[1][4],  # Urgencia (mayor primero)
+            -x[1][1]  # Payload (menor primero - más rápido)
+        ), reverse=True)
+        
+        # Asegurar que tenemos exactamente NUM_FLUJOS_OBSERVABLES candidatos
+        if len(candidatos) > self.NUM_FLUJOS_OBSERVABLES:
+            candidatos = candidatos[:self.NUM_FLUJOS_OBSERVABLES]
+        
+        while len(candidatos) < self.NUM_FLUJOS_OBSERVABLES:
+            candidatos.append((-1, [0.0, 0.0, 0.0, 0.0, 0.0]))
+        
+        # 5. Actualizar los índices de flujos candidatos para recuperarlos después
+        self.current_candidate_flows = [idx for idx, _ in candidatos if idx >= 0]
+        
+        # Registro para depuración
+        if self.current_candidate_flows:
+            self.logger.debug(f"Candidatos ordenados: {[self.flows[idx].flow_id for idx in self.current_candidate_flows]}")
+        
+        # 6. Construir la observación completa concatenando características
+        obs = np.array(global_features + [feat for _, feats in candidatos for feat in feats], dtype=np.float32)
+        
+        return obs
+
+    # ------------------------------------------------------------------ #
+    #  Máscaras de acción                                                #
+    # ------------------------------------------------------------------ #
+    def action_masks(self):
+        """
+        Genera máscaras para el espacio de acción MultiDiscreto.
+        """
+        # Calcular tamaño total de la máscara sumando todas las dimensiones
+        mask_size = sum(self.action_space.nvec)
+        
+        # Crear una máscara plana donde todas las acciones están permitidas (0 = permitida)
+        mask = np.zeros(mask_size, dtype=np.int8)
+        
+        try:
+            if self.current_flow_idx < len(self.flows) and not self.flow_completed[self.current_flow_idx]:
+                flow = self.current_flow()
+                hop_idx = self.flow_progress[self.current_flow_idx]
+                
+                if hop_idx < len(flow.path):
+                    link = self.link_dict[flow.path[hop_idx]]
+                    
+                    # Si es el primer hop, los factores de guard time altos podrían desperdiciarse
+                    if hop_idx == 0:
+                        # Índice para guard time alto
+                        offset = 0  # No offset needed anymore
+                        mask[offset + 3] = 1  # Desactivar valores 3 y 4 (factores altos)
+                        mask[offset + 4] = 1
+        except Exception as e:
+            self.logger.warning(f"Error generando máscaras de acción: {e}")
+            
+        return mask
+
+    # --------------------------------------------------------------------- #
+    #  Comprobaciones de aislamiento y GCL                                  #
+    # --------------------------------------------------------------------- #
+    def _is_es_source(self, link_id):
+        """
+        Devuelve True si el **origen** de link_id es una End-Station (ES).
+        1) Primero consulta el atributo ``node_type`` del grafo.
+        2) Si no existe, usa la convención de nombres:
+           E*, C*  = clientes/ES genéricas  
+           SRV*    = servidores (también ES)  
+           S*      = switches
+        """
+        if link_id in self._es_node_cache:
+            return self._es_node_cache[link_id]
+
+        src = link_id[0] if isinstance(link_id, tuple) else link_id.split('-')[0]
+
+        # a) Metadata del grafo (más robusta)
+        if self.graph.nodes.get(src, {}).get("node_type") == "ES":
+            self._es_node_cache[link_id] = True
+            return True
+
+        # b) Convención de nombres
+        is_es = src.startswith(("E", "C", "SRV"))
+        self._es_node_cache[link_id] = is_es
+        return is_es
+
+    #  ⛔  Retirado.  La agrupación de GCL dejó de ser necesaria.
+
+    def _check_valid_link(self, link, operation):
+        return check_valid_link(link, operation, self.current_flow(), self.links_operations)
+
+    def _check_temp_operations(self):
+        return check_temp_operations(self.temp_operations, self.links_operations, self.current_flow())
+
+    def _find_next_event_time(self, current_time):
+        """Encuentra el siguiente tiempo de evento programado después de current_time"""
+        return find_next_event_time(self.link_busy_until, self.switch_busy_until, current_time)
+
+    # Método obsoleto: generación dinámica de GCL eliminada.
+    # Se mantiene para compatibilidad pero no hace nada y devuelve False.
+    def add_gating_with_grouping(self, *args, **kwargs):
+        return False
+
+    def increase_complexity(self):
+        """Incrementa el nivel de dificultad del entorno"""
+        if not self.curriculum_enabled or self.current_complexity >= 1.0:
+            return False
+            
+        # Incrementar complejidad gradualmente
+        self.current_complexity = min(1.0, self.current_complexity + self.curriculum_step)
+        return True
+
+    # --------------------------------------------------------------------- #
+    #  Método principal step() - delegado al módulo environment_impl         #
+    # --------------------------------------------------------------------- #
+    from core.learning.environment_impl import step  # (sigue igual, pero sin GCL)
+
+    # --------------------------------------------------------------------- #
+    #  gym stubs                                                             #
+    # --------------------------------------------------------------------- #
+    def render(self):
+        pass
+
+    def close(self):
+        pass
+
+
+
+## ARCHIVO: core/learning/environment_impl.py
+## ==================================================
+
+import math
+import numpy as np
+from core.learning.env_utils import ErrorType, SchedulingError, find_next_event_time
+from core.network.net import Net
+from core.network.operation import Operation
+# import directo (la función sigue existiendo)
+from core.learning.env_actions import process_step_action
+# Add missing import for logging
+import logging
+
+def step(self, action):
+    """
+    Realiza un paso en el entorno según la acción proporcionada.
+    
+    Este método implementa la lógica principal para:
+    - Procesar la acción del agente
+    - Calcular tiempos de transmisión
+    - Manejar conflictos
+    - Actualizar el estado del entorno
+    - Calcular la recompensa
+    
+    Args:
+        action: Acción multidimensional del agente RL
+        
+    Returns:
+        Tuple: (observación, recompensa, terminado, truncado, info)
+    """
+    try:
+        # NUEVO: Extraer la selección de flujo de la acción y aplicarla ANTES de procesar
+        flow_selection = int(action[-1])  # La última dimensión es la selección de flujo
+        
+        # IMPORTANTE: Aplicar la selección de flujo inmediatamente
+        flow_reward_adj = 0.0
+        original_flow_idx = self.current_flow_idx  # Guardar para comprobar si cambió
+        
+        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
+            if 0 <= flow_selection < len(self.current_candidate_flows):
+                selected_idx = self.current_candidate_flows[flow_selection]
+                if not self.flow_completed[selected_idx]:
+                    # Verificar que el flujo seleccionado tiene un hop válido para programar
+                    if self.flow_progress[selected_idx] < len(self.flows[selected_idx].path):
+                        self.current_flow_idx = selected_idx
+                        
+                        # Añadir información de debug para seguimiento
+                        self.logger.info(f"Agente seleccionó flujo {self.flows[selected_idx].flow_id} (índice {selected_idx}) de candidatos: {[self.flows[idx].flow_id for idx in self.current_candidate_flows]}")
+                        
+                        # Evaluar si la selección fue buena basándose en características
+                        selected_flow = self.flows[selected_idx]
+                        
+                        # Calcular recompensa por selección inteligente
+                        period_factor   = 1.0 - (selected_flow.period / 10000)
+                        payload_factor  = 1.0 - (selected_flow.payload / Net.MTU)
+                        remaining       = len(selected_flow.path) - self.flow_progress[selected_idx]
+                        progress_factor = remaining / len(selected_flow.path)
+
+                        flow_reward_adj = (period_factor * 0.15 +
+                                           payload_factor * 0.15 +
+                                           progress_factor * 0.15)
+                        
+                        self.logger.debug(f"Flow selection: {flow_selection} → candidate #{selected_idx} (Flow {selected_flow.flow_id})")
+                        self.logger.debug(f"Flow reward adjustment: +{flow_reward_adj:.4f}")
+        
+        # ──────────────────────────────────────────────────────────────
+        #  ENFORCE PRIORITY SCHEDULING - IMMEDIATE FORWARDING FROM SWITCHES
+        # ──────────────────────────────────────────────────────────────
+        fifo_idx = self._next_fifo_idx()
+        if fifo_idx is None:
+            # No quedan flujos pendientes – debería terminar normalmente
+            return self._get_observation(), 0, True, False, {"success": True}
+
+        if self.current_flow_idx != fifo_idx:
+            # Priorizar la transmisión desde switches
+            prev_flow = self.flows[self.current_flow_idx]
+            new_flow = self.flows[fifo_idx]
+            prev_hop_idx = self.flow_progress[self.current_flow_idx]
+            new_hop_idx = self.flow_progress[fifo_idx]
+            
+            # Verificar si es un cambio a un flujo que está en un switch esperando
+            if new_hop_idx > 0:
+                prev_link_id = new_flow.path[new_hop_idx - 1]
+                dst_node = prev_link_id[1] if isinstance(prev_link_id, tuple) else prev_link_id.split('-')[1]
+                is_at_switch = dst_node.startswith('S') and not dst_node.startswith('SRV')
+                
+                if is_at_switch:
+                    self.logger.debug(f"Priorizando transmisión inmediata desde switch: flujo {new_flow.flow_id}")
+            
+            # Actualizar el flujo actual
+            self.current_flow_idx = fifo_idx
+
+        # A partir de aquí TODO el código sigue igual: ya trabajamos con el
+        # flujo correcto; si posteriormente no cabe en el período, se lanzará
+        # el SchedulingError habitual y el episodio terminará "con error".
+        
+        # Procesar la acción y obtener la información necesaria
+        # ➋  Desestructuramos el nuevo elemento `guard_factor`
+        (flow, hop_idx, link, gating, trans_time,
+         guard_time, guard_factor,                # ← aquí
+         offset_us, switch_gap, sw_src,
+         is_egress_from_switch, gcl_strategy) = process_step_action(self, action)
+
+        # ------------------------------------------------------------ #
+        # 1. Calcular tiempos                                          #
+        # ------------------------------------------------------------ #
+        if hop_idx == 0:        # ---------- primer hop ----------
+            # Si no se entrega una red, construir topología y flujos sencillos
+            if self.flow_first_tx[self.current_flow_idx] is None:
+                self.flow_first_tx[self.current_flow_idx] = self.global_time
+            # ❶  Primer hop: basta con que el enlace esté libre
+            # ➡️  Sólo el *primer* enlace respeta Net.PACKET_GAP_EXTRA
+            earliest = max(
+                self.link_busy_until[link],
+                self.global_queue_busy_until,
+                self.last_packet_start + self._next_packet_gap()
+            )  # Removed offset_us
+            # Obtener el switch de destino para este paquete
+            dst_node = link.link_id[1] if isinstance(link.link_id, tuple) else link.link_id.split('-')[1]
+            if dst_node.startswith('S'):
+                # Asegurar separación mínima de 1μs entre llegadas al switch
+                # Calcula el tiempo de llegada *potencial* al switch
+                potential_arrival_time = earliest + trans_time + Net.DELAY_PROP
+                min_arrival_time = self.switch_last_arrival[dst_node] + switch_gap
+                if potential_arrival_time < min_arrival_time:
+                    # Ajustar el tiempo de inicio para garantizar 1μs de separación en destino
+                    delay = min_arrival_time - potential_arrival_time
+                    earliest += delay
+                    # Actualizar el tiempo de llegada real
+                    arrival_time = min_arrival_time
+                else:
+                    arrival_time = potential_arrival_time
+                # Actualizar el último tiempo de llegada registrado para este switch
+                self.switch_last_arrival[dst_node] = arrival_time
+
+            # Re-calcular la ventana tras cualquier retraso aplicado
+            latest = earliest + Net.SYNC_ERROR
+
+            # Para el primer hop desde ES, no hay gating. Dequeue es el inicio más temprano.
+            offset   = 0            # sin margen de sincronía
+            dequeue  = earliest     # comienza tan pronto el enlace queda libre
+            end_time = dequeue + trans_time
+            if end_time > flow.period:
+                 # Primer hop (sale de una ES): no hay switch para crear espera
+                 raise SchedulingError(ErrorType.PeriodExceed, "Excedió período")
+
+            # --- Crear objeto Operation para hop_idx == 0 ---
+            op_start_time = earliest
+            op_gating_time = None # No hay gating desde ES
+            op_latest_time = latest # Usamos latest calculado
+            op_end_time = end_time
+            # Crear la operación AHORA para que 'op' esté definida
+            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+
+            # ➕ GUARDAR datos que el visualizador necesita
+            op.guard_factor      = guard_factor      # decisión RL
+            op.min_gap_value     = switch_gap        # decisión RL
+            op.guard_time        = guard_time        # longitud real del guard-band
+
+        else:                   # ---------- hops siguientes ----------
+            # ❷  Resto de hops:
+            prev_link_id = flow.path[hop_idx - 1]
+            prev_link = self.link_dict[prev_link_id]
+            prev_op = self.links_operations[prev_link][-1][1]
+
+            # Tiempo base: cuando el paquete está listo en el nodo actual
+            packet_ready_time = prev_op.reception_time
+
+            # Earliest possible start considerando sólo llegada y disponibilidad del ENLACE
+            # ⚠️  En hops posteriores **no** aplicamos la separación global:
+            earliest_possible_start_on_link = max(packet_ready_time,
+                                         self.link_busy_until[link],
+                                         self.global_queue_busy_until)  # Removed offset_us
+
+            # Earliest start considerando también la disponibilidad del PUERTO del SWITCH (si aplica)
+            if is_egress_from_switch:
+                # FCFS se mantiene, pero no registramos la espera (no la decide el agente)
+                final_earliest_start = max(earliest_possible_start_on_link,
+                                            self.switch_busy_until[sw_src])
+            else:
+                final_earliest_start = earliest_possible_start_on_link
+
+            # Calcular la ventana 'latest' basada en el inicio más temprano real
+            latest = final_earliest_start + Net.SYNC_ERROR
+
+            # Determinar el tiempo real de DEQUEUE (inicio de transmisión)
+            offset   = 0            # sin margen de sincronía
+            dequeue  = final_earliest_start
+            
+            # Calcular tiempo de fin de transmisión
+            end_time = dequeue + trans_time
+            if end_time > flow.period:
+                # Si no cabe en su periodo, abortar sin intentos de recolocación
+                raise SchedulingError(ErrorType.PeriodExceed, "Excedió período")
+
+            # --- Crear objeto Operation ---
+            # start_time: Cuándo podría haber empezado (llegada + disponibilidad enlace)
+            # gating_time: Cuándo empezó realmente (dequeue), si aplica gating
+            # latest_time: Límite superior de la ventana para gating
+            # end_time: Cuándo terminó la transmisión
+            op_start_time = earliest_possible_start_on_link
+            op_gating_time = dequeue if gating and is_egress_from_switch else None 
+            # Importante: Si hay gating, latest_time debe ser igual a gating_time
+            if gating and is_egress_from_switch:
+                op_latest_time = op_gating_time  # Si hay gating, ambos deben ser iguales
+            else:
+                op_latest_time = latest  # Sin gating, latest_time mantiene su valor normal
+
+            op_end_time = end_time
+
+            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+
+            # ➕ Actualizar también en la rama "hops > 0"
+            op.guard_factor  = guard_factor
+            op.min_gap_value = switch_gap
+            op.guard_time    = guard_time
+            # No guardamos esperas que no sean decisión del agente
+
+            # ── Nuevo: garantizar separación mínima entre llegadas al switch destino ──
+            dst_node = link.link_id[1] if isinstance(link.link_id, tuple) \
+                       else link.link_id.split('-')[1]
+            if dst_node.startswith('S'):                       # sólo switches reales
+                arrival = op.reception_time - Net.DELAY_PROC_RX
+                min_arrival = self.switch_last_arrival[dst_node] + switch_gap
+                if arrival < min_arrival:
+                    delay = min_arrival - arrival
+                    op.add(delay)              # ajusta *todos* los tiempos de la operación
+                    op.min_gap_wait += delay   # registrar espera por gap mínimo
+                    dequeue   += delay
+                    end_time  += delay
+                    op_start_time += delay
+                    op_end_time   += delay
+                    arrival = min_arrival
+                # Registrar llegada para el siguiente paquete
+                self.switch_last_arrival[dst_node] = arrival
+
+        # --- Regla *un‑solo‑paquete‑switch* ---
+        # 2. Crear operación temporal                                  #
+        # ------------------------------------------------------------ #
+        # op ya está creado con los tiempos correctos
+        self.temp_operations.append((link, op))
+
+        # Resolver conflictos por desplazamiento
+        offset = self._check_temp_operations()
+        max_iter = 16  # salvaguarda contra bucles infinitos
+        while offset is not None and max_iter:
+            # Desplazar la operación según el offset de conflicto
+            op_start_time += offset
+            
+            # Actualizar TODAS las propiedades temporales
+            if op_gating_time is not None:
+                # Con gating, todo se desplaza por igual
+                op_gating_time += offset
+                op_latest_time += offset  # latest siempre alineado con gating
+            else:
+                # Sin gating, latest avanza con start (son independientes)
+                op_latest_time += offset
+            
+            # Tiempo final siempre se recalcula respecto al inicio real
+            op_end_time = (op_gating_time if op_gating_time is not None else op_start_time) + trans_time
+
+            # Recrear la operación con los nuevos tiempos
+            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+            
+            # Si hay gating, validar que aún está dentro del período del flujo
+            if op_gating_time is not None and op_end_time > flow.period:
+                # El inicio real ocurriría después del final del período
+                raise SchedulingError(
+                    ErrorType.PeriodExceed, 
+                    "Flow cycles into next period"
+                )
+            
+            # Recrear el array de operaciones temporales con la actualizada
+            self.temp_operations = [(link, op)]
+            
+            # Volver a verificar conflictos
+            offset = self._check_temp_operations()
+            max_iter -= 1
+            
+            # Use default fixed conflict resolution strategy
+            # (previous conflict_strategy action dimension was removed)
+            # Apply a small minimum offset to ensure progress
+            if offset is not None and offset == 0:
+                offset = max(1, int(switch_gap * Net.SWITCH_GAP_MIN))
+
+        if max_iter == 0 and offset is not None:
+            raise SchedulingError(
+                ErrorType.PeriodExceed,
+                "Failed to resolve conflict after 16 iterations"
+            )
+
+        #  ⛔  Ya no se generan ni reservan reglas GCL durante el scheduling.
+
+        # ---------- REWARD SHAPING ----------
+        GB_PEN      = 0.05   # guard-band (sí la decide RL)
+
+        reward = 1.0
+        reward -= GB_PEN * (guard_time / flow.period)
+
+        # NUEVO: Añadir el ajuste de recompensa por selección inteligente de flujo
+        reward += flow_reward_adj
+
+    except SchedulingError as e:
+        self.logger.info(f"Fallo: {e.msg} (flujo {self.current_flow_idx})")
+        return self._get_observation(), -1, True, False, {"success": False}
+
+    # ------------------------------------------------------------ #
+    # 3. Avanzar progreso del flujo                                #
+    # ------------------------------------------------------------ #
+    self.links_operations[link].append((flow, op))
+    self.temp_operations.clear()
+
+    # 🌐 Registrar sólo si es el *primer* hop del flujo
+    if hop_idx == 0:
+        self.last_packet_start = op_start_time
+
+    # ❷  Marcar el enlace como ocupado hasta que el paquete esté completamente recibido Y PROCESADO
+    # Usar reception_time que ya incluye DELAY_PROP + DELAY_PROC_RX
+    self.link_busy_until[link] = op.reception_time  # En lugar de op.end_time + Net.DELAY_PROP
+    # 🔒 Mantener la sección crítica ocupada hasta que el frame se recibe
+    self.global_queue_busy_until = op.reception_time
+
+    if is_egress_from_switch:                 # ❷ liberar switch al terminar
+        # El switch se considera ocupado solo hasta que termina de transmitir el paquete
+        # Sin guard_time adicional para la ocupación del switch
+        self.switch_busy_until[sw_src] = op.end_time  # CORREGIDO: Eliminar guard_time
+        
+        # El guard_time solo afecta a cuándo puede empezar otra transmisión por el mismo puerto,
+        # pero el switch ya terminó su trabajo con este paquete en end_time
+
+    self.flow_progress[self.current_flow_idx] += 1
+
+    # ❸  El "reloj" global se redefine como el evento más temprano pendiente
+    next_events = [*self.link_busy_until.values(),
+                  *self.switch_busy_until.values()]
+    # Si no quedan eventos pendientes, mantenemos el reloj en lugar de "rebobinar" a 0
+    self.global_time = min(next_events, default=self.global_time)
+
+    # ¿Terminó este flujo?
+    if self.flow_progress[self.current_flow_idx] == len(flow.path):
+        self.flow_completed[self.current_flow_idx] = True
+        # ---------- verificación latencia extremo-a-extremo ----------
+        fst = self.flow_first_tx[self.current_flow_idx]
+        e2e_latency = op.reception_time - fst if fst is not None else 0
+        
+        # NUEVO: Guardar latencia e2e para análisis
+        self.last_operation_info['e2e_latency'] = e2e_latency
+        
+        # *Incluir* la propagación y el procesamiento de RX en el presupuesto
+        # 💡 Tomar el peor‑caso acumulativo sobre la ruta completa
+        hops = len(flow.path)
+        e2e_budget = (flow.e2e_delay +                      # presupuesto nominal
+                      Net.DELAY_PROP   * hops +            # propagación
+                      Net.DELAY_PROC_RX * hops +           # procesado RX
+                      guard_time        * (hops - 1))      # guard‑band por hop
+        if e2e_latency > e2e_budget:
+            raise SchedulingError(ErrorType.PeriodExceed,
+                                  f"E2E delay {e2e_latency} > {e2e_budget}")
+        reward += 2
+
+    # ¿Terminó episodio?
+    done = all(self.flow_completed)
+    
+    # Después de procesar un hop de un flujo, si el destino es un switch,
+    # inmediatamente preparar el siguiente hop para transmisión
+    if not done and hop_idx < len(flow.path) - 1:
+        dst_node = link.link_id[1] if isinstance(link.link_id, tuple) else link.link_id.split('-')[1]
+        if dst_node.startswith('S') and not dst_node.startswith('SRV'):
+            # Este paquete llegó a un switch, marcar como alta prioridad
+            # para ser procesado en el siguiente paso
+            arrival_time = op.reception_time
+            self.switch_last_arrival[dst_node] = min(arrival_time, self.switch_last_arrival[dst_node])
+            
+            # Actualizar el reloj global para favorecer el procesamiento inmediato
+            # de este paquete que acaba de llegar al switch
+            if arrival_time < self.global_time:
+                next_events = [*self.link_busy_until.values(), *self.switch_busy_until.values(), arrival_time]
+                self.global_time = min(next_events)
+
+    # Gestionar el curriculum learning
+    if done and all(self.flow_completed):
+        # Episodio exitoso: incrementar contador de éxitos consecutivos
+        self.consecutive_successes += 1
+        # Añadir bonificación de recompensa proporcional al nivel de complejidad
+        reward += 5.0 * self.current_complexity
+        
+        # Mostrar información del progreso del curriculum
+        if self.curriculum_enabled:
+            self.logger.info(f"Éxito con {len(self.flows)}/{self.total_flows} flujos (complejidad: {self.current_complexity:.2f}, éxitos: {self.consecutive_successes}/3)")
+    
+    info = {
+        "success": done,
+        "ScheduleRes": self.links_operations.copy() if done else None,
+        "curriculum_level": self.current_complexity,
+        "num_flows": len(self.flows),
+        # NUEVO: Añadir información sobre selección de flujos
+        "flow_selection": {
+            "current_flow_idx": self.current_flow_idx,
+            "available_candidates": getattr(self, 'current_candidate_flows', []),
+            "selected_option": flow_selection,
+            "reward_adj": flow_reward_adj
+        }
+    }
+
+    return self._get_observation(), reward, done, False, info
+
+
+
+## ARCHIVO: core/learning/training_metrics.py
+## ==================================================
+
+# This file is intentionally empty. All metrics functionality has been removed.
+
+
+
+## ARCHIVO: core/network/__init__.py
+## ==================================================
+
+"""
+Módulos de modelado de red y topologías
+"""
+
+from .net import Flow, Link, Net, Network, generate_graph, generate_flows, FlowGenerator
+from .operation import Operation, check_operation_isolation
+
+
+
+
+
+## ARCHIVO: core/network/net.py
+## ==================================================
+
+import logging
+import math
+import networkx as nx
+import numpy as np
+import random
+import typing
+
+# Conjunto de períodos disponibles
+PERIOD_SET = [2000, 4000, 8000]
+
+class Net:
+    # Configuración de red y temporizaciones
+    MTU = 1518
+    # ➡️ Nueva: separación mínima entre llegadas sucesivas al mismo switch (µs)
+    SWITCH_GAP_MIN = 1
+
+    # ➡️ **NUEVO** – parámetros para la separación probabilística entre creaciones
+    #     de paquetes (sólo se evalúa en el PRIMER hop de cada flujo)
+    #
+    #     • PACKET_GAP_MODE:
+    #         ─ fixed        → separación constante = PACKET_GAP_EXTRA
+    #         ─ uniform      → U[min,max]  definido en PACKET_GAP_UNIFORM
+    #         ─ exponential  → Exp(λ)  con media = PACKET_GAP_EXTRA
+    #         ─ gaussian     → N(μ,σ²)  definido en PACKET_GAP_GAUSS
+    #         ─ pareto       → Pareto(α,xm) definido en PACKET_GAP_PARETO
+    #     • Los valores se configuran desde CLI en ui/train.py / ui/test.py.
+    #
+    PACKET_GAP_MODE    = "fixed"
+    PACKET_GAP_EXTRA   = 0
+    PACKET_GAP_UNIFORM = (0, 0)       # sólo usado si mode == uniform
+    # Nuevos contenedores para gaussian y pareto
+    PACKET_GAP_GAUSS   = (0.0, 1.0)   # μ, σ
+    PACKET_GAP_PARETO  = (2.0, 1.0)   # α, x_m
+
+    # ------------------------------------------------------------------
+    #  Configuración centralizada desde CLI
+    # ------------------------------------------------------------------
+    @staticmethod
+    def set_gap_distribution(dist: str, params: list[float] | None = None):
+        """
+        Ajusta la distribución global del gap entre creaciones de paquetes.
+
+        ─ dist = fixed        → params = [gap]
+        ─ dist = uniform      → params = [min, max]
+        ─ dist = exponential  → params = [mean]
+        ─ dist = gaussian     → params = [mean, sigma]
+        ─ dist = pareto       → params = [alpha, x_m]
+        """
+        params = params or []
+        Net.PACKET_GAP_MODE = dist
+
+        if dist == "fixed":
+            Net.PACKET_GAP_EXTRA = int(params[0]) if params else 0
+
+        elif dist == "uniform":
+            assert len(params) == 2, "--dist-params necesita MIN MAX"
+            Net.PACKET_GAP_UNIFORM = (int(params[0]), int(params[1]))
+
+        elif dist == "exponential":
+            Net.PACKET_GAP_EXTRA = int(params[0]) if params else 1
+
+        elif dist == "gaussian":
+            assert len(params) >= 2, "--dist-params necesita MU SIGMA"
+            Net.PACKET_GAP_GAUSS = (float(params[0]), float(params[1]))
+
+        elif dist == "pareto":
+            assert len(params) == 2, "--dist-params necesita ALPHA XM"
+            Net.PACKET_GAP_PARETO = (float(params[0]), float(params[1]))
+
+        else:
+            raise ValueError(f"Distribución desconocida: {dist}")
+
+    @staticmethod
+    def sample_packet_gap() -> int:
+        """Devuelve la separación (µs) según la configuración global."""
+        if Net.PACKET_GAP_MODE == "fixed":
+            return Net.PACKET_GAP_EXTRA
+        elif Net.PACKET_GAP_MODE == "uniform":
+            lo, hi = Net.PACKET_GAP_UNIFORM
+            return random.randint(lo, hi) if hi > lo else lo
+        elif Net.PACKET_GAP_MODE == "exponential":
+            μ = max(Net.PACKET_GAP_EXTRA, 1)      # evita λ=0
+            return int(random.expovariate(1/μ))
+        elif Net.PACKET_GAP_MODE == "gaussian":
+            μ, σ = Net.PACKET_GAP_GAUSS
+            # recortamos a ≥0 y redondeamos
+            return max(0, int(random.gauss(μ, σ)))
+        elif Net.PACKET_GAP_MODE == "pareto":
+            α, xm = Net.PACKET_GAP_PARETO
+            # random.paretovariate devuelve xm*(1-U)^(-1/α) con xm=1
+            return int(random.paretovariate(α)*xm)
+        else:
+            raise ValueError(f"Modo de gap desconocido: {Net.PACKET_GAP_MODE}")
+  
+    DELAY_PROC_RX = 1  # Nuevo: tiempo de procesamiento de recepción
+    SYNC_ERROR = 0  # Sin incertidumbre: relojes perfectamente alineados
+    DELAY_PROP = 1
+    GCL_CYCLE_MAX = 128000
+    # Longitud máxima típica de un Gate Control List en hardware TSN (open/close)
+    GCL_LENGTH_MAX = 256
+
+class Link:
+    embedding_length = 3
+
+    def __init__(self, link_id, link_rate):
+        self.link_id = link_id
+        self.gcl_capacity = Net.GCL_LENGTH_MAX
+        self.link_rate = link_rate
+
+    def __hash__(self):
+        return hash(self.link_id)
+
+    def __eq__(self, other):
+        return isinstance(other, Link) and self.link_id == other.link_id
+
+    def __repr__(self):
+        return f"Link{self.link_id}"
+
+    def interference_time(self):
+        return self.transmission_time(Net.MTU)
+
+    def transmission_time(self, payload):
+        # 12B para IFG, 8B para preámbulo
+        return math.ceil((payload + 12 + 8) * 8 / self.link_rate)
+
+class Flow:
+    def __init__(self, flow_id, src_id, dst_id, path, period=2000, payload=100, e2e_delay=None):
+        self.flow_id = flow_id
+        self.src_id = src_id
+        self.dst_id = dst_id
+        self.path = path
+        # Validar período
+        assert period in PERIOD_SET, f"Período inválido {period}"
+        self.period = period
+        self.payload = payload
+        self.e2e_delay = period if e2e_delay is None else e2e_delay
+        # Jitter completamente eliminado
+
+    def __hash__(self):
+        return hash(self.flow_id)
+
+    def __eq__(self, other):
+        return isinstance(other, Flow) and self.flow_id == other.flow_id
+
+    def __repr__(self):
+        return f"Flow(id='{self.flow_id}', src='{self.src_id}', dst='{self.dst_id}', period={self.period})"
+
+# Funciones para generar topologías simplificadas
+def generate_graph(topo, link_rate=100):
+    """Genera diferentes topologías de grafo según el tipo especificado"""
+    if topo == "SIMPLE":
+        return generate_simple_topology(link_rate)
+    elif topo == "UNIDIR":
+        return generate_unidirectional_topology(link_rate)
+    else:
+        raise ValueError(f"Topología desconocida: {topo}. Solo se soportan 'SIMPLE' y 'UNIDIR'")
+
+def generate_simple_topology(link_rate: int = 100):
+    """Genera una topología S-E-S mínima con identificadores **tuple**.
+
+    Mantener el mismo tipo de ``link_id`` en toda la base de código
+    evita las múltiples llamadas a ``split('-')`` y simplifica las
+    comprobaciones de si un nodo es *switch* o *end-station*.
+    """
+    graph = nx.DiGraph()
+    graph.add_node("S1", node_type="SW")
+
+    for node in ("C1", "C2", "SRV1"):
+        graph.add_node(node, node_type="ES")
+        # Enlaces bidireccionales (src, dst)
+        graph.add_edge(node, "S1", link_id=(node, "S1"), link_rate=link_rate)
+        graph.add_edge("S1", node, link_id=("S1", node), link_rate=link_rate)
+
+    return graph
+
+def generate_unidirectional_topology(link_rate=100):
+    """Genera una topología unidireccional donde los datos fluyen solo de clientes a servidor"""
+    graph = nx.DiGraph()
+    # Crear nodos
+    graph.add_node("S1", node_type="SW")
+    for node in ["C1", "C2", "SRV1"]:
+        graph.add_node(node, node_type="ES")
+    # Crear enlaces unidireccionales
+    for client in ["C1", "C2"]:
+        graph.add_edge(client, "S1", link_id=(client, "S1"), link_rate=link_rate)
+    graph.add_edge("S1", "SRV1", link_id=("S1", "SRV1"), link_rate=link_rate)
+    return graph
+
+def _transform_line_graph(graph):
+    """Transforma un grafo en su línea de grafo y crea diccionario de enlaces"""
+    line_graph = nx.line_graph(graph)
+    links_dict = {node: Link(node, graph.edges[node]['link_rate']) for node in line_graph.nodes}
+    return line_graph, links_dict
+
+class Network:
+    def __init__(self, graph, flows):
+        self.graph = graph
+        self.flows = flows
+        # Construir línea de grafo y diccionario de enlaces
+        self.line_graph, self.links_dict = _transform_line_graph(graph)
+
+    def disable_gcl(self, num_nodes):
+        """Deshabilita la capacidad GCL para un número específico de nodos"""
+        list_nodes = random.sample(list(self.graph.nodes), num_nodes)
+        list_links = []
+        for node in list_nodes:
+            list_links.extend([link for link in self.links_dict.values() if node == link.link_id[0]])
+        for link in list_links:
+            link.gcl_capacity = 0
+
+    def set_gcl(self, num_gcl):
+        """Establece la capacidad GCL para todos los enlaces"""
+        for link in self.links_dict.values():
+            link.gcl_capacity = num_gcl
+
+class FlowGenerator:
+    def __init__(self, graph, seed=None, period_set=None, min_payload=1500, max_payload=1518): # Añadir min/max payload
+        self.graph = graph
+        # Inicializar semilla para reproducibilidad
+        if seed is not None:
+            random.seed(seed)
+        # Inicializar conjunto de períodos usando el global PERIOD_SET como default
+        self.period_set = period_set if period_set is not None else PERIOD_SET
+        for period in self.period_set:
+            assert isinstance(period, int) and period > 0
+        # Jitters eliminado
+        # Identificar nodos finales
+        self.es_nodes = [n for n, d in graph.nodes(data=True) if d['node_type'] == 'ES']
+        self.num_generated_flows = 0
+        # Guardar rango de payload
+        self.min_payload = min_payload
+        self.max_payload = max_payload
+        assert self.min_payload <= self.max_payload, "min_payload debe ser <= max_payload"
+
+    def _generate_flow(self):
+        """Genera un único flujo aleatorio"""
+        # Seleccionar dos nodos aleatorios
+        src_id, dst_id = random.sample(self.es_nodes, 2)
+        # Calcular ruta más corta
+        path = nx.shortest_path(self.graph, src_id, dst_id)
+        path = [(path[i], path[i+1]) for i in range(len(path)-1)]
+        # Seleccionar período aleatorio
+        period = random.choice(self.period_set)
+
+        # Crear flujo con payload aleatorio dentro del rango especificado
+        flow = Flow(
+            f"F{self.num_generated_flows}", src_id, dst_id, path,
+            payload=random.randint(self.min_payload, self.max_payload), # Usar el rango
+            period=period
+        )
+        self.num_generated_flows += 1
+        return flow
+
+    def __call__(self, num_flows=1):
+        """Genera un conjunto de flujos aleatorios"""
+        return [self._generate_flow() for _ in range(num_flows)]
+
+class UniDirectionalFlowGenerator(FlowGenerator):
+    def _generate_flow(self):
+        """Genera un flujo unidireccional desde clientes a servidores"""
+        # Identificar nodos cliente y servidor
+        client_nodes = [n for n in self.es_nodes if n.startswith('C')]
+        server_nodes = [n for n in self.es_nodes if n.startswith('SRV')]
+        
+        # Si no hay clientes o servidores, usar generación normal
+        if not client_nodes or not server_nodes:
+            return super()._generate_flow()
+            
+        # Seleccionar origen y destino
+        src_id = random.choice(client_nodes)
+        dst_id = random.choice(server_nodes)
+        
+        # Calcular ruta
+        path = nx.shortest_path(self.graph, src_id, dst_id)
+        path = [(path[i], path[i+1]) for i in range(len(path)-1)]
+        
+        # Seleccionar parámetros
+        period = random.choice(self.period_set)
+        
+        # Crear flujo con payload aleatorio dentro del rango especificado
+        flow = Flow(
+            f"F{self.num_generated_flows}", src_id, dst_id, path,
+            payload=random.randint(self.min_payload, self.max_payload), # Usar el rango
+            period=period
+        )
+        self.num_generated_flows += 1
+        return flow
+
+def generate_flows(graph, num_flows=50, seed=None, period_set=PERIOD_SET, unidirectional=False, min_payload=1500, max_payload=1518): # Añadir min/max payload
+    """Función para generar flujos con configuración específica"""
+    generator_class = UniDirectionalFlowGenerator if unidirectional else FlowGenerator
+    # Pasar el rango de payload al constructor del generador
+    generator = generator_class(graph, seed, period_set, min_payload, max_payload)
+    return generator(num_flows)
+
+
+
+## ARCHIVO: core/network/operation.py
+## ==================================================
+
+import copy
+from dataclasses import dataclass
+import math
+from typing import Optional
+import numpy as np
+
+from core.network.net import Net  # Añadido para acceder a Net.DELAY_PROC_RX
+
+@dataclass
+class Operation:
+    start_time: int
+    gating_time: Optional[int]
+    latest_time: int  # must equal to gating time if enable gating
+    end_time: int
+    # Nuevos campos para análisis y visualización
+    reception_time: Optional[int] = None
+    
+    # Solo se conserva la espera por *min-gap* (controlada por RL)
+    min_gap_wait: int = 0
+    
+    # Campos para decisiones de RL (eliminado gcl_cycle_opt)
+    guard_factor: float = 1.0
+    min_gap_value: float = 1.0
+    conflict_strategy: int = 0
+
+    def __post_init__(self):
+        if self.gating_time is not None:
+            assert self.start_time <= self.gating_time == self.latest_time < self.end_time, \
+                   "Invalid Operation: desajuste temporal"
+        else:
+            assert self.start_time <= self.latest_time < self.end_time, "Invalid Operation"
+        
+        # Calcular automáticamente el tiempo de recepción completa si no se proporciona
+        if self.reception_time is None:
+            # Tomar en cuenta retardo de propagación y procesamiento de recepción
+            self.reception_time = self.end_time + Net.DELAY_PROP + Net.DELAY_PROC_RX
+
+    def add(self, other: int | np.integer):
+        """
+        Desplaza la operación en ``other`` µs.
+        Acepta enteros python normales **o** cualquier subtipo de ``np.integer``.
+        """
+        # Convertir numpy.int* a int nativo para evitar fallos de tipo
+        if isinstance(other, np.integer):
+            other = int(other)
+        assert isinstance(other, int), "Operation.add() espera un entero"
+
+        self.start_time += other
+        if self.gating_time is not None:
+            self.gating_time += other
+        self.latest_time += other
+        self.end_time += other
+        # earliest_time ya no existe o se alinea con start_time
+        # Actualizar reception_time también
+        if self.reception_time is not None:
+             self.reception_time += other
+        return self
+
+    def __repr__(self):
+        if self.gating_time is not None:
+            return (f"Operation(start={self.start_time}, gate={self.gating_time}, "
+                    f"end={self.end_time}, rcv={self.reception_time})")
+        return (f"Operation(start={self.start_time}, latest={self.latest_time}, "
+                f"end={self.end_time}, rcv={self.reception_time})")
+
+    # ➕ Utilidad
+    @property
+    def duration(self):
+        """Duración efectiva de la transmisión (end − start)"""
+        return self.end_time - self.start_time
+
+    # Nueva propiedad para obtener el desglose de esperas
+    @property
+    def wait_breakdown(self):
+        """Retorna un diccionario con el desglose de las causas de espera"""
+        if self.gating_time is None or self.gating_time <= self.start_time:
+            return {}
+        
+        total_wait = self.gating_time - self.start_time
+        result = {
+            'total': total_wait,
+            'min_gap': self.min_gap_wait,
+            'other': total_wait - self.min_gap_wait
+        }
+        return result
+
+    # Eliminar la propiedad jitter_percent
+    
+    # Método para registrar el período asociado
+    def set_period(self, period: int):
+        """Almacena el período asociado a esta operación para cálculos posteriores"""
+        self._period = period
+        return self
+
+#
+def check_operation_isolation(operation1: tuple[Operation, int],
+                              operation2: tuple[Operation, int]) -> Optional[int]:
+    """
+
+    :param operation1:
+    :param operation2:
+    :return: None if isolation constraint is satisfied,
+             otherwise, it returns the offset that `operation1` should add.
+             Notice that the adding the returned offset might make `operation` out of period.
+    """
+    operation1, period1 = operation1
+    operation2, period2 = operation2
+
+    assert (operation1.start_time >= 0) and (operation1.end_time <= period1)
+    assert (operation2.start_time >= 0) and (operation2.end_time <= period2)
+
+    hyper_period = math.lcm(period1, period2)
+    alpha = hyper_period // period1
+    beta = hyper_period // period2
+
+    operation_lhs = copy.deepcopy(operation1)
+
+    for _ in range(alpha):
+
+        operation_rhs = copy.deepcopy(operation2)
+        for _ in range(beta):
+            if (operation_lhs.start_time <= operation_rhs.start_time < operation_lhs.end_time) or \
+                    (operation_rhs.start_time <= operation_lhs.start_time < operation_rhs.end_time):
+                return operation_rhs.end_time - operation_lhs.start_time
+            operation_rhs.add(period2)
+
+        operation_lhs.add(period1)
+    return None
+
+
+
+## ARCHIVO: core/omnet_export.py
+## ==================================================
+
+"""core.omnet_export
+---------------------------------
+Utilities to export a `Network` plus a scheduling result (`ScheduleRes`)
+obtained with `ui/test.py` into two artefacts ready to be consumed by
+OMNeT++ NET‑TSN:
+
+* **<name>.ned** –  the physical topology as a `network` definition.
+* **<name>.ini** –  simulation configuration that reproduces the exact
+  cyclic traffic (period, payload, initial offset) *and* programmes the
+  time‑aware shaping gate according to the static GCL derived during the
+  DRL scheduling step.
+
+Files are *always* overwritten if they already exist.
+
+This module is completely decoupled from the rest of the code‑base – it
+only relies on public attributes of `core.network` objects, on the final
+`ScheduleRes`, and on the «GCL tables» returned by `ResAnalyzer`.
+"""
+
+from __future__ import annotations
+
+import os
+import math
+from pathlib import Path
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+from core.network.net import Network, Flow, Link
+from core.scheduler.scheduler import ScheduleRes
+
+# ---------------------------------------------------------------------------
+#  UTILIDADES DE FORMATO  (↓ se usan en todo el módulo, por eso van primero)
+# ---------------------------------------------------------------------------
+μs = 1e-6
+
+def _us_to_ms_str(us: int) -> str:
+    """µs → "x.xxms" sin ceros sobrantes."""
+    return f"{us * μs * 1_000:.3f}ms".rstrip("0").rstrip(".")
+
+# ---------- helpers para puertos y PCP ----------
+def _build_period_order(flows: list["Flow"]) -> dict[int, int]:
+    """Mapa período→índice incremental (2000 µs⇒0 → UDP 2000, 4000 µs⇒1 → 2001…)."""
+    unique = sorted({f.period for f in flows})
+    return {p: i for i, p in enumerate(unique)}
+
+def _flow_port(period: int, period_order: dict[int, int]) -> int:
+    return 2000 + period_order[period]
+
+# PCP: 4 para primer flujo por cliente, 7 el resto
+def _pcp_for_flow(node_name: str, seen: dict[str, int]) -> int:
+    pcp = 4 if seen[node_name] == 0 else 7
+    seen[node_name] += 1
+    return pcp
+
+def _first_tx_offset_us(schedule_res: "ScheduleRes", fl: "Flow") -> int:
+    """
+    Devuelve el **start_time** del primer hop del flujo `fl`.
+
+    🔸 La comparación se hace por `flow_id` (==) en lugar de identidad
+       de objetos, porque los `Flow` en `schedule_res` pueden ser copias.
+    """
+    first_link_id = fl.path[0]            # (src, dst) del primer salto
+    for link, ops in schedule_res.items():
+        if link.link_id != first_link_id:
+            continue
+        for f, op in ops:
+            if f.flow_id == fl.flow_id:   # ← comparación robusta
+                return op.start_time
+    # fallback – no debería ocurrir
+    return 0
+
+# ---------------------------------------------------------------------------
+#  Small helpers                                                               
+# ---------------------------------------------------------------------------
+
+# (las tres funciones ya se han adelantado)
+
+
+def _indent(n: int) -> str:
+    return " " * n
+
+
+# ---------------------------------------------------------------------------
+#  NED generation                                                             
+# ---------------------------------------------------------------------------
+
+
+def _ned_node_line(node_name: str, node_type: str, xpos: int, ypos: int) -> str:
+    """Return a *submodule* line for a node with display coordinates."""
+    return (
+        f"        {node_name}: <default(\"{node_type}\")> like IEthernetNetworkNode {{\n"
+        f"            @display(\"p={xpos},{ypos}\");\n"
+        f"        }}\n"
+    )
+
+
+#  ────────────────────────────────────────────────────────────────────────────
+#  INI generation
+#  ────────────────────────────────────────────────────────────────────────────
+
+def _ini_general(net_name: str, gate_port: int) -> str:
+    return (
+        "#########################################################\n"
+        "#  AUTOGENERATED BY gatingdrl omnet_export.py            #\n"
+        "#########################################################\n"
+        "[General]\n"
+        f"network = {net_name}\n"
+        "sim-time-limit   = 24ms\n"
+        'description      = "Auto-imported schedule"\n\n'
+        "**.displayGateSchedules = true\n"
+        # Mostrar por defecto todos los puertos (el filtro se puede afinar después)
+        f'**.gateFilter = "**.eth[{gate_port}].**"\n'
+        "**.gateScheduleVisualizer.height = 16\n"
+        '**.gateScheduleVisualizer.placementHint = "top"\n\n'
+    )
+
+def _ini_flows(
+        flows: List["Flow"],
+        schedule_res: ScheduleRes,
+        network: "Network"           # ← necesitamos acceso al grafo
+) -> str:
+    """
+    Construye la sección SOURCES + SINKS a partir de la lista completa de flujos.
+    No debe lanzar excepción – si un flujo carece de algún dato, lo salta y sigue.
+    """
+    by_src: Dict[str, List["Flow"]] = {}
+    by_dst: Dict[str, List["Flow"]] = {}
+    for f in flows:
+        by_src.setdefault(f.src_id.lower(), []).append(f)
+        by_dst.setdefault(f.dst_id.lower(), []).append(f)
+
+    txt = "#########################################################\n"
+    txt += "#  SOURCES                                               #\n"
+    txt += "#########################################################\n"
+    # ▸ Puerto UDP único por cliente (2000 + índice del cliente)
+    client_port_map: Dict[str, int] = {
+        n: 2000 + i for i, n in enumerate(sorted(by_src.keys()))
+    }
+    seen_per_client: Dict[str, int] = defaultdict(int)
+    for node, list_flows in by_src.items():
+        txt += f"*.{node}.numApps           = {len(list_flows)}\n"
+        txt += f"*.{node}.app[*].typename   = \"UdpSourceApp\"\n"
+        txt += f"*.{node}.app[*].io.destAddress = \"srv1\"\n\n"
+
+        for idx, fl in enumerate(list_flows):
+            # ──────────── NUEVO: etiqueta legible para el flujo ────────────
+            # Usa el flow_id ('F0', 'F1'…) en minúsculas  →  "f0", "f1", …
+            # Si se prefiere "video-1" basta con reemplazar la siguiente línea
+            display_name = fl.flow_id.lower()
+            txt += f"*.{node}.app[{idx}].display-name   = \"{display_name}\"\n"
+
+            # ➋ Offset = «Disponible (start time)» ⇒ op.start_time
+            off_us = _first_tx_offset_us(schedule_res, fl)
+            off_ms = _us_to_ms_str(off_us)
+            
+            # ➊ Tamaño de trama = payload mostrado en «INFORMACIÓN DE FLUJOS»
+            #    (no restamos 54 B de cabeceras; es exactamente el valor listado).
+            length = max(64, fl.payload)
+
+            txt += f"*.{node}.app[{idx}].source.productionInterval = {fl.period*μs*1_000:.0f}ms\n"
+            txt += f"*.{node}.app[{idx}].source.initialProductionOffset = {off_ms}\n"
+            txt += f"*.{node}.app[{idx}].source.packetLength = {length}B\n"
+
+            dport = client_port_map[node]           # puerto fijo por cliente
+            txt  += f"*.{node}.app[{idx}].io.destPort = {dport}\n"
+
+            pcp = _pcp_for_flow(node, seen_per_client)
+            txt += (f"*.{node}.app[{idx}].bridging.streamIdentifier.identifier.mapping = "
+                    f"[{{stream: \"{fl.flow_id}\", packetFilter: expr(udp.destPort == {dport})}}]\n")
+            txt += (f"*.{node}.app[{idx}].bridging.streamCoder.encoder.mapping = "
+                    f"[{{stream: \"{fl.flow_id}\", pcp: {pcp}}}]\n\n")
+
+    # ------- habilitar outgoing streams por cliente -----------
+    for node in by_src.keys():
+        txt += f"*.{node}.hasOutgoingStreams = true\n"
+
+    # ------- habilitar egress shaping en cada switch ----------
+    sw_nodes = [n.lower() for n, d in network.graph.nodes(data=True)
+                if d.get("node_type") == "SW"]
+    for sw in sw_nodes:
+        txt += f"*.{sw}.hasEgressTrafficShaping = true\n"
+        txt += (f"*.{sw}.bridging.directionReverser.reverser."
+                f"excludeEncapsulationProtocols = [\"ieee8021qctag\"]\n")
+
+    txt += "\n#########################################################\n"
+    txt += "#  SINKS                                                 #\n"
+    txt += "#########################################################\n"
+    for node, list_flows in by_dst.items():
+        txt += f"*.{node}.numApps         = {len(list_flows)}\n"
+        txt += f"*.{node}.app[*].typename = \"UdpSinkApp\"\n"
+        for idx, _ in enumerate(list_flows):
+            txt += f"*.{node}.app[{idx}].io.localPort = {2000+idx}\n"
+        txt += "\n"
+
+    return txt
+
+def _ini_gcl(
+    gcl: Dict["Link", List[Tuple[int, int]]],
+    network: "Network",
+    gate_port: int = 0,           # ← puerto declarado en **.gateFilter
+) -> str:
+    """
+    Genera la sección de programación Time-Aware para cada puerto de switch.
+    Si `gcl` está vacío simplemente devuelve cadena vacía.
+    """
+    if not gcl:
+        return ""
+
+    txt = "#########################################################\n"
+    txt += "#  TIME-AWARE TRAFFIC SHAPING                           #\n"
+    txt += "#########################################################\n"
+
+    for link, table in gcl.items():
+        src = link.link_id[0] if isinstance(link.link_id, tuple) else link.link_id.split('-')[0]
+        dst = link.link_id[1] if isinstance(link.link_id, tuple) else link.link_id.split('-')[1]
+        # Usa el mismo índice que figura en **.gateFilter
+        port = gate_port
+
+        # ────────────────  UNA sola cola "video" ─────────────────
+        txt += f"*.{src.lower()}.eth[{port}].macLayer.queue.numTrafficClasses = 1\n"
+        txt += f"*.{src.lower()}.eth[{port}].macLayer.queue.*[0].display-name = \"video\"\n"
+
+        # Gate único TC0 – usar **la tabla que ya imprimió ResAnalyzer**.
+        #     ⮑  No se vuelven a ordenar ni a recalcular tiempos.
+        # ➊  Hiperperíodo = m.c.m. de los períodos de *toda la red*
+        import math as _m
+        hyperperiod = 1
+        for _f in network.flows:
+            hyperperiod = _m.lcm(hyperperiod, _f.period)
+
+        # ► LA TABLA LLEGA TAL CUAL SE IMPRIMIO EN
+        #   "TABLA GCL GENERADA (t, estado)"  ◄
+        #   ─ no se toca, sólo se ordena por tiempo.
+        # ── tabla "corta" que llega desde ResAnalyzer ──
+        events = sorted(table, key=lambda x: x[0])  # ya viene filtrada
+
+        # Ordenar la tabla generada y *reemplazar* su PRIMER registro
+        #     por "abierto en 0 µs" (no se añade, se sustituye).
+        if events:
+            events[0] = (0, 1)      # primer registro forzado
+        else:
+            events = [(0, 1)]       # salvaguarda: lista vacía
+
+        # Elimina duplicados consecutivos (p.ej. …, (0,1), (0,1), …)
+        compact: list[tuple[int, int]] = []
+        for t, s in events:
+            if not compact or compact[-1][1] != s:
+                compact.append((t, s))
+
+        durations = [(compact[(i+1)%len(compact)][0] - t) % hyperperiod
+                     for i, (t, _) in enumerate(compact)]
+
+        txt += f"*.{src.lower()}.eth[{port}].macLayer.queue.transmissionGate[0].offset = 0ms\n"
+        txt += f"*.{src.lower()}.eth[{port}].macLayer.queue.transmissionGate[0].durations = "
+        txt += f"[{', '.join(_us_to_ms_str(d) for d in durations)}]\n"
+
+        # ────────────────────────────────────────────────────────────────────
+        #  DEBUG   Comparar la tabla original (events) con la reconstruida
+        #          a partir de las durations que vamos a escribir.
+        # ────────────────────────────────────────────────────────────────────
+        #
+        # 1.  Tabla "original" (la que viene de ResAnalyzer) ────────────────
+        orig_table = sorted(table, key=lambda x: x[0])    # [(t,state), ...]
+
+        # 2.  Reconstruir tabla a partir de durations  ─────────────────────
+        recon_table: list[tuple[int,int]] = []
+        t_acc = 0
+        state = 1                      # siempre arrancamos "abierto"
+        for d in durations:
+            recon_table.append((t_acc, state))
+            t_acc = (t_acc + d) % hyperperiod
+            state = 1 - state          # alternar 1↔0
+
+        # 3.  Normalizar y ordenar para comparar
+        recon_norm = sorted(recon_table, key=lambda x: x[0])
+        orig_norm  = orig_table
+
+        if recon_norm != orig_norm:
+            import textwrap, logging
+            logging.warning(
+                "\n".join([
+                    "",
+                    "────────────────────────────────────────────────────────",
+                    f"GCL CHECK  ⟹  DIFERENCIA EN PUERTO {src}.eth[{port}]",
+                    "────────────────────────────────────────────────────────",
+                    "ORIGINAL:          RECONSTRUIDA DESDE durations:",
+                    *[
+                        f"{o[0]:>6} µs | {o[1]}        ||      "
+                        f"{r[0]:>6} µs | {r[1]}"
+                        for o, r in zip(
+                            orig_norm + [('', '')]*(len(recon_norm)-len(orig_norm)),
+                            recon_norm + [('', '')]*(len(orig_norm)-len(recon_norm))
+                        )
+                    ],
+                    "────────────────────────────────────────────────────────",
+                    "Revisa la lógica que genera «durations»: puede que se",
+                    "esté filtrando/eliminando algún evento o que el orden",
+                    "de los mismos no sea exactamente el original.",
+                    ""
+                ])
+            )
+
+    return txt
+
+
+def write_ned(network: Network, outfile: os.PathLike, pkg: str, net_name: str) -> None:
+    """Generate a .ned file representing *exactly* the passed network."""
+
+    # ── Simple – we only need node names and edges.  Use a naïve layout: ──
+    # • End‑stations on the left (x ≈ 300)  – spread vertically in steps
+    # • Switches   in the middle (x ≈ 500)
+    # • Servers    on the right (x ≈ 700)
+
+    es_nodes = [n for n, d in network.graph.nodes(data=True) if d.get("node_type") == "ES"]
+    sw_nodes = [n for n, d in network.graph.nodes(data=True) if d.get("node_type") == "SW"]
+
+    server_nodes = [n for n in es_nodes if n.startswith("SRV")]
+    client_nodes = [n for n in es_nodes if n not in server_nodes]
+
+    # Coordinates
+    step = 80
+    submod_lines: List[str] = []
+
+    for i, name in enumerate(client_nodes):
+        submod_lines.append(_ned_node_line(name.lower(), "TsnDevice", 300, 200 + i * step))
+
+    for i, name in enumerate(sw_nodes):
+        submod_lines.append(_ned_node_line(name.lower(), "TsnSwitch", 500, 250 + i * step))
+
+    for i, name in enumerate(server_nodes):
+        submod_lines.append(_ned_node_line(name.lower(), "TsnDevice",
+                                         700, 250 + i * step))
+
+    # Connections – iterate original directed edges and create <--> pairs.
+    conn_lines: List[str] = []
+    added = set()
+    for src, dst, edata in network.graph.edges(data=True):
+        # Create deterministic id for unordered pair to avoid duplicates
+        key = tuple(sorted((src, dst)))
+        if key in added:
+            continue
+        added.add(key)
+
+        # Mantener el mismo alias en las conexiones
+        def _alias(n: str) -> str:
+            return n.lower()
+        conn_lines.append(
+            f"        {_alias(src)}.ethg++ <--> EthernetLink <--> {_alias(dst)}.ethg++;\n"
+        )
+        
+    net_name = Path(outfile).stem          # p.ej.  «unidir»
+    # Detectar bitrate (asumimos que todos los enlaces comparten valor)
+    try:
+        first_edge = next(iter(network.graph.edges(data=True)))
+        link_rate = first_edge[2].get("link_rate", 100)
+    except StopIteration:
+        link_rate = 100
+
+    ned = (
+        f"package {pkg};\n\n"
+        "import inet.node.ethernet.EthernetLink;\n"
+        "import inet.node.contract.IEthernetNetworkNode;\n"
+        "import inet.node.tsn.TsnDevice;\n"
+        "import inet.node.tsn.TsnSwitch;\n"
+        "import inet.networks.base.TsnNetworkBase;\n\n"
+        f"network {net_name.lower()} extends TsnNetworkBase\n"  # Force lowercase here
+        "{\n"
+        "    parameters:\n"
+        f"        *.eth[*].bitrate = default({link_rate}Mbps);\n"
+        "    submodules:\n"
+        + "".join(submod_lines)
+        + "\n    connections:\n"
+        + "".join(conn_lines)
+        + "}\n"
+    )
+
+    Path(outfile).write_text(ned, encoding="utf-8")
+
+def write_ini(
+    network: Network,
+    schedule_res: ScheduleRes,
+    gcl_tables: Dict[Link, List[Tuple[int, int]]],
+    outfile: os.PathLike,
+    net_name: str,
+    gate_port: int,
+) -> None:
+    """Generate an .ini file reproducing traffic & GCL schedule.
+    
+    This function never fails completely - if problems occur during generation,
+    it will still produce at least a basic INI file with the [General] section.
+    """
+    try:
+        flows = list(network.flows)
+        num_flows = len(flows)
+        
+        parts: List[str] = [_ini_general(net_name, gate_port)]
+        try:
+            parts.append(_ini_flows(flows, schedule_res, network))
+        except Exception as exc:
+            import logging
+            logging.warning(f"[omnet_export] Error generating FLOWS section: {exc}")
+            parts.append(f"#  (ERROR generando sección SOURCES / SINKS: {exc})\n")
+
+        try:
+            parts.append(_ini_gcl(gcl_tables, network, gate_port))
+        except Exception as exc:
+            import logging
+            logging.warning(f"[omnet_export] Error generating GCL section: {exc}")
+            parts.append(f"#  (ERROR generando sección GCL: {exc})\n")
+
+        Path(outfile).write_text("".join(parts), encoding="utf-8")
+            
+    except Exception as e:
+        import logging
+        logging.error(f"[omnet_export] Critical error generating INI file: {e}")
+        # Ensure at least a minimal INI file is written
+        minimal_ini = "[General]\nnetwork = inet.showcases.tsn.generated.GeneratedTsnNetwork\n"
+        Path(outfile).write_text(minimal_ini, encoding="utf-8")
+
+def export_omnet_files(network: Network, schedule_res: ScheduleRes, gcl_tables: Dict[Link, List[Tuple[int, int]]], label: str, out_dir: os.PathLike, gate_port:int=2) -> Tuple[Path, Path]:
+    """Create *.ned & *.ini in *out_dir* (overwriting any previous version)."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Create a subdirectory for this topology if it doesn't exist
+    topo_dir = Path(out_dir) / label
+    topo_dir.mkdir(exist_ok=True, parents=True)
+
+    ned_path = topo_dir / f"{label}.ned"
+    ini_path = topo_dir / f"{label}.ini"
+
+    pkg = "inet.showcases.tsn.trafficshaping.Pruebas_tesis.Red_" + label
+    net_name = label.lower()
+
+    write_ned(network, ned_path, pkg, net_name)
+    write_ini(network, schedule_res, gcl_tables, ini_path, net_name, gate_port)
+
+    print(f"[omnet_export]  generated → {ned_path}, {ini_path}")
+    return ned_path, ini_path
+
+
+
+## ARCHIVO: core/scheduler/__init__.py
+## ==================================================
+
+"""
+Algoritmos de scheduling para Time Sensitive Networks
+"""
+
+from .scheduler import DrlScheduler, ResAnalyzer, ScheduleRes
+
+
+
+
+
+## ARCHIVO: core/scheduler/scheduler.py
+## ==================================================
+
+import logging
+import os
+from typing import Dict, List, Tuple
+import math
+from collections import defaultdict
+
+import numpy as np
+from sb3_contrib import MaskablePPO
+# Usamos el mismo extractor que durante el entrenamiento
+from core.learning.encoder import FeaturesExtractor
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+from tools.definitions import OUT_DIR
+from core.network.net import Flow, Link, Network, Net
+from core.network.operation import Operation
+from core.learning.environment import NetEnv
+
+# Tipo para resultados
+ScheduleRes = Dict[Link, List[Tuple[Flow, Operation]]]
+
+class DrlScheduler:
+    """Scheduler TSN usando Deep Reinforcement Learning con MaskablePPO"""
+    
+    def __init__(self, network: Network, num_envs=1, timeout_s=300, use_curriculum=False):
+        """Inicializa el scheduler con una red y opcionalmente número de entornos"""
+        self.network = network
+        self.num_flows = len(network.flows)
+        self.num_envs = num_envs
+        self.timeout_s = timeout_s
+        # Explicitly pass curriculum_enabled=False for testing
+        self.env = DummyVecEnv([
+            lambda: NetEnv(network, curriculum_enabled=use_curriculum, initial_complexity=1.0) 
+            for _ in range(num_envs)
+        ])
+        # Mantener consistencia con el extractor usado al entrenar.
+        policy_kwargs = dict(features_extractor_class=FeaturesExtractor)
+        self.model = MaskablePPO(
+            "MlpPolicy",
+            self.env,
+            verbose=0,
+            policy_kwargs=policy_kwargs,
+        )
+        self.res = None
+        logging.info(f"Scheduler inicializado con {self.num_flows} flujos (curriculum: {use_curriculum})")
+        
+    def load_model(self, filepath: str, alg='MaskablePPO'):
+        """Carga un modelo pre-entrenado"""
+        if filepath.endswith('.zip'):
+            filepath = filepath[:-4]
+        if not os.path.isfile(f"{filepath}.zip"):
+            logging.error(f"Modelo no encontrado: {filepath}.zip")
+            return False
+        try:
+            self.model = MaskablePPO.load(filepath, self.env)
+            logging.info(f"Modelo cargado: {filepath}")
+            return True
+        except Exception as e:
+            logging.error(f"Error cargando modelo: {e}")
+            return False
+        
+    def schedule(self) -> bool:
+        """Ejecuta el scheduling usando el modelo DRL"""
+        self.res = None
+        
+        # Intentar hasta 100 episodios como máximo
+        for _ in range(100):   # +100 % intentos ⇒ mayor tasa de éxito
+            obs = self.env.reset()
+            done = False
+            
+            # Procesar un episodio completo
+            while not done:
+                # Predecir acción con máscara
+                # `env_method` devuelve una lista de arrays (uno por entorno);
+                # apilamos para obtener shape (n_envs, n_actions).
+                action_masks = np.vstack(self.env.env_method('action_masks'))
+                # Asegurar dtype int8 para plena compatibilidad
+                action, _ = self.model.predict(
+                    obs, deterministic=True, action_masks=action_masks.astype(np.int8)
+                )
+                
+                # Ejecutar acción
+                obs, _, dones, infos = self.env.step(action)
+
+                # ⬇️  Propagar correctamente la terminación del episodio
+                done = any(dones)
+
+                if done:
+                    for i, is_done in enumerate(dones):
+                        if is_done and infos[i].get('success'):
+                            self.res = infos[i].get('ScheduleRes')
+                            return True      # éxito ⇒ abandonar bucle de episodios
+                    # Reiniciar si terminó sin éxito
+                    obs = self.env.reset()
+                    done = False
+            
+        # Si llegamos aquí, no se encontró solución
+        return False
+    
+    def get_res(self) -> ScheduleRes:
+        """Retorna el resultado del scheduling"""
+        return self.res
+
+class ResAnalyzer:
+    """Analiza y guarda resultados del scheduling"""
+    
+    # Threshold for GCL entry generation - easily modifiable class variable
+    DEFAULT_GCL_GAP_THRESHOLD = 30
+    
+    def __init__(self, network: Network, results: ScheduleRes):
+        """
+        Inicializa el analizador y guarda resultados
+        
+        Args:
+            network: Red TSN
+            results: Resultado del scheduling
+        """
+        self.network = network
+        self.results = results
+        self.analyzer_id = id(self) # Generar un ID único para el analizador
+        
+        # Set instance variable from class default
+        self.gap_threshold_us = self.DEFAULT_GCL_GAP_THRESHOLD
+        
+        # --- NUEVO: Calcular y almacenar tablas GCL estáticas ---
+        self._gcl_tables = self._calculate_gcl_tables(self.gap_threshold_us)
+        # --- FIN NUEVO ---
+
+        # Guardar resultados a archivo
+        if results:
+            # Asegurarse de que el directorio OUT_DIR existe
+            os.makedirs(OUT_DIR, exist_ok=True)
+            
+            # Usar el formato "by_link" consistentemente
+            filename = os.path.join(OUT_DIR, f'schedule_res_by_link_{self.analyzer_id}.log')
+            try:
+                with open(filename, 'w') as f:
+                    for link, operations in results.items():
+                        f.write(f"Enlace: {link}\n")
+                        for flow, op in operations:
+                            f.write(f"  Flujo: {flow.flow_id}, Op: {op}\n")
+                        f.write("\n")
+                logging.info(f"Resultados guardados en {filename}")
+            except Exception as e:
+                logging.error(f"Error al guardar resultados: {e}")
+
+    # --- NUEVO: Método para calcular las tablas GCL --------------------------
+    def _calculate_gcl_tables(self, gap_thr_us: int = None) -> Dict[Link, List[Tuple[int, int]]]:
+        """
+        Genera la tabla GCL (lista de pares «tiempo, estado») para cada
+        puerto-switch.
+
+        ▸ Sólo se insertan 0/1 cuando el hueco entre la recepción de un paquete
+          y el comienzo del siguiente supera `gap_thr_us` µs (default: valor de self.gap_threshold_us).
+        ▸ Se enlaza el último paquete del hiperperíodo con el primero para que
+          el cierre final también quede reflejado.
+        ▸ IMPORTANTE: Para cada par de eventos, se añade un 0 (cierre) y un 1 (apertura)
+        """
+        from math import lcm
+        
+        # El umbral viene del atributo de instancia (por defecto 30 µs,
+        # o el que se haya pasado vía --gcl-threshold).  **NO** lo
+        # sobre-escribimos aquí; así generamos la "tabla corta".
+        gcl_tables: Dict[Link, List[Tuple[int, int]]] = {}
+        if not self.results:
+            return gcl_tables
+
+        for link, ops in self.results.items():
+            # Sólo puertos cuyo ORIGEN es un switch ("S…", excluyendo "SRV…")
+            src = link.link_id[0] if isinstance(link.link_id, tuple) else link.link_id.split("-")[0]
+            if not (src.startswith("S") and not src.startswith("SRV")):
+                continue
+
+            # 1️⃣  Ordenar operaciones por inicio real (gating_time o start_time)
+            ops_sorted = sorted(ops, key=lambda p: (p[1].gating_time or p[1].start_time))
+            n = len(ops_sorted)
+            if n == 0:
+                continue
+
+            # 2️⃣  Calcular hiperperíodo de ese puerto
+            gcl_cycle = 1
+            for f, _ in ops_sorted:
+                gcl_cycle = lcm(gcl_cycle, f.period)
+
+            # 3️⃣  Analizar cada operación – reset de listas por-link
+            all_transmission_times: list[tuple[int, str]] = []
+            all_reception_times:    list[tuple[int, str]] = []
+            
+            hyperperiod_link = gcl_cycle  # Hiperperiodo para este enlace
+
+            #     Crear un par de eventos 0/1 por paquete
+            for i in range(n):
+                f_curr, op_curr = ops_sorted[i]
+                
+                # Índice del siguiente paquete (con wraparound)
+                next_idx = (i + 1) % n
+                f_next, op_next = ops_sorted[next_idx]
+
+                # Tiempo cuando termina de llegar este paquete (necesitamos cerrar el gate)
+                close_time = op_curr.reception_time
+                
+                # Tiempo cuando inicia la transmisión del siguiente paquete (reabrimos el gate)
+                open_time = op_next.gating_time or op_next.start_time
+                
+                # Si es el último paquete, añadir un período para el wraparound
+                if i == n - 1:
+                    open_time += f_next.period
+
+                # Calcular el gap entre recepción y siguiente transmisión
+                gap = open_time - close_time
+                
+                # Para cada paquete, repetirlo durante todo el hiperperíodo
+                repetitions = hyperperiod_link // f_curr.period
+                for rep in range(repetitions):
+                    offset = rep * f_curr.period
+                    # Guardar tiempo de inicio y recepción (normalizado al hiperperiodo)
+                    tx_t = (op_curr.start_time + offset) % hyperperiod_link
+                    rx_t = (op_curr.reception_time + offset) % hyperperiod_link
+                    all_transmission_times.append((tx_t, f_curr.flow_id))
+                    all_reception_times.append((rx_t, f_curr.flow_id))
+
+            # Ordenar los tiempos
+            all_transmission_times.sort(key=lambda x: x[0])
+            all_reception_times.sort(key=lambda x: x[0])
+            
+            # PASO 2: Generar eventos GCL con la tabla COMPLETA
+            gcl_close_events: list[tuple[int,str,int,str]] = []
+            
+            # Buscar gaps significativos entre recepción y siguiente transmisión
+            for rx_time, rx_flow in all_reception_times:
+                
+                # ➊ Iniciar variables cada iteración
+                next_tx_time: int | None = None
+                next_tx_flow: str | None = None
+
+                # Buscar la siguiente transmisión > rx_time
+                for tx_time, tx_flow in all_transmission_times:
+                    if tx_time > rx_time:
+                        next_tx_time = tx_time
+                        next_tx_flow = tx_flow
+                        break
+
+                # Si no hay ninguna (wraparound) usa la primera del ciclo + hiperperíodo
+                if next_tx_time is None and all_transmission_times:
+                    first_tx_time, first_tx_flow = all_transmission_times[0]
+                    next_tx_time = first_tx_time + hyperperiod_link
+                    next_tx_flow = first_tx_flow
+                
+                # Protección extra – si, aun así, no existe TX, saltar este RX
+                if next_tx_time is None:
+                    continue
+                 
+                # Calcular el gap siempre (tabla completa – sin filtro)
+                gap = (next_tx_time - rx_time) % hyperperiod_link
+
+                #  Sólo añadimos el par 0/1 cuando el hueco supera
+                #  el threshold definido por el usuario.
+                if gap > gap_thr_us:
+                    # Añadir eventos de cierre/apertura
+                    gcl_close_events.append(
+                        (rx_time, rx_flow, next_tx_time, next_tx_flow)
+                    )
+
+            # PASO 3: Generar los pares de eventos 0/1 para cada gap significativo
+            events: List[Tuple[int, int]] = []
+            for rx_time, rx_flow, next_tx_time, next_tx_flow in gcl_close_events:
+                # Añadir evento de cierre (0) en el tiempo de recepción
+                events.append((rx_time, 0))
+                    
+                # Añadir evento de apertura (1) cuando empieza el siguiente paquete
+                events.append((next_tx_time % hyperperiod_link, 1))
+
+            # 4️⃣  Ordenar todos los eventos por tiempo
+            events.sort(key=lambda x: (x[0], x[1]))
+            
+            # 5️⃣  Eliminar estados duplicados o redundantes consecutivos
+            final_table: List[Tuple[int, int]] = []
+            last_state: int | None = None
+            for t, s in events:
+                if s != last_state:  # Solo añadir si cambia el estado
+                    final_table.append((t, s))
+                    last_state = s
+
+            # 6️⃣  Garantizar que la tabla empiece "abierta" en t = 0 µs
+            if not final_table or final_table[0][0] != 0:
+                final_table.insert(0, (0, 1))
+            elif final_table[0][0] == 0 and final_table[0][1] == 0:
+                # Si el primer evento es cerrar en t=0, añadir apertura en t=0 antes
+                final_table.insert(0, (0, 1))
+
+            gcl_tables[link] = final_table
+
+        return gcl_tables
+
+    # --- NUEVO: Método para recalcular GCL con threshold diferente ---
+    def recalculate_gcl_tables(self, new_threshold_us: int) -> Dict[Link, List[Tuple[int, int]]]:
+        """
+        Recalcula las tablas GCL con un nuevo threshold.
+        
+        Args:
+            new_threshold_us: Nuevo valor de threshold en µs
+            
+        Returns:
+            Diccionario con las nuevas tablas GCL
+        """
+        # Update instance threshold
+        self.gap_threshold_us = new_threshold_us
+        
+        # Recalculate tables
+        self._gcl_tables = self._calculate_gcl_tables(new_threshold_us)
+        
+        # Log the change
+        print(f"GCL tables recalculated with threshold: {new_threshold_us}µs")
+        
+        return self._gcl_tables
+
+    # --- NUEVO: Método para imprimir información de los flujos ---
+    def print_flow_info(self):
+        """Imprime una tabla con información detallada de cada flujo, incluyendo tamaños de paquete."""
+        if not self.network or not self.network.flows:
+            print("\nNo hay información de flujos disponible.")
+            return
+            
+        print("\n" + "="*80)
+        print("INFORMACIÓN DE FLUJOS")
+        print("="*80)
+        
+        # Definir formato de tabla
+        format_str = "{:<8} | {:<8} | {:<8} | {:<10} | {:<12} | {:<6}"
+        
+        # Imprimir cabecera
+        print(format_str.format("Flujo", "Origen", "Destino", "Período (µs)", "Payload (B)", "Hops"))
+        print("-"*8 + " | " + "-"*8 + " | " + "-"*8 + " | " + "-"*10 + " | " + "-"*12 + " | " + "-"*6)
+        
+        # Imprimir cada flujo
+        scheduled_flows = set()
+        if self.results:
+            for link_ops in self.results.values():
+                for flow, _ in link_ops:
+                    scheduled_flows.add(flow.flow_id)
+        
+        for flow in self.network.flows:
+            # Verificar si el flujo fue programado exitosamente
+            status = "✓" if flow.flow_id in scheduled_flows else ""
+            
+            # Calcular número de hops
+            num_hops = len(flow.path)
+            
+            # Imprimir información
+            print(format_str.format(
+                flow.flow_id, 
+                flow.src_id, 
+                flow.dst_id, 
+                flow.period, 
+                flow.payload,
+                f"{num_hops} {status}"
+            ))
+            
+        print("="*80 + "\n")
+
+    # --- NUEVO: Método para imprimir las tablas GCL ---
+    def print_gcl_tables(self):
+        """
+        Imprime las tablas GCL estáticas.
+        Muestra solo la tabla GCL generada sin referencia a umbrales.
+        """
+        if not self._gcl_tables:
+            print("\nNo se generaron tablas GCL (posiblemente no hubo gating o scheduling falló).")
+            return
+
+        print("\n" + "="*80)
+        print("TABLA GCL GENERADA (t, estado)")
+        print("="*80)
+
+        for link, table in self._gcl_tables.items():
+            # Re-calcular gcl_cycle aquí para mostrarlo
+            gated_ops = [(f, op) for f, op in self.results.get(link, []) if op.gating_time is not None]
+            if not gated_ops: continue
+            gcl_cycle = 1
+            for f, _ in gated_ops:
+                gcl_cycle = math.lcm(gcl_cycle, f.period)
+
+            print(f"\n--- Enlace: {link.link_id} (Ciclo GCL: {gcl_cycle} µs) ---")
+            print(f"{'Tiempo (µs)':<12} | {'Estado':<6}")
+            print(f"{'-'*12} | {'-'*6}")
+            for time, state in table:
+                print(f"{time:<12} | {state:<6}")
+
+        print("="*80 + "\n")
+
+
+
+## ARCHIVO: path_setup.py
+## ==================================================
+
+import os
+import sys
+import logging
+
+# Obtener la ruta del directorio actual (donde está este script)
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Añadir al sys.path para permitir importaciones relativas
+if PROJECT_ROOT not in sys.path:
+    # Insertar al inicio para asegurar que tiene prioridad sobre otras instalaciones
+    sys.path.insert(0, PROJECT_ROOT)
+    logging.getLogger(__name__).debug(f"Added {PROJECT_ROOT} to PYTHONPATH")
+
+# Diagnóstico: mostrar el path de Python completo
+
+
+
+
+## ARCHIVO: project_analyzer.py
+## ==================================================
+
+#!/usr/bin/env python3
+
+import os
+import sys
+
+# Archivos y directorios a excluir
+EXCLUDED_FILES = {
+  
+}
+EXCLUDED_DIRS = {
+    '__pycache__', 
+    '.git', 
+    '.idea', 
+    'venv', 
+    'env', 
+    'build', 
+    'dist'
+}
+
+def collect_python_files(root_path):
+    """Recopila todas las rutas de archivos Python en el proyecto"""
+    py_files = []
+    for root, dirs, files in os.walk(root_path):
+        # Evitar directorios excluidos
+        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS]
+        
+        # Procesar archivos Python
+        for file in files:
+            if file.endswith('.py') and file not in EXCLUDED_FILES:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, root_path)
+                py_files.append((rel_path, full_path))
+    
+    # Ordenar los archivos por ruta relativa para mejor lectura
+    return sorted(py_files)
+
+def save_code_to_file(py_files, output_file='project_code.txt'):
+    """Guarda el contenido de todos los archivos en un único archivo de texto"""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        
+        f.write("# ===================================\n\n")
+        
+        for rel_path, full_path in py_files:
+            f.write(f"## ARCHIVO: {rel_path}\n")
+            f.write("## " + "=" * 50 + "\n\n")
+            
+            try:
+                with open(full_path, 'r', encoding='utf-8') as src_file:
+                    content = src_file.read()
+                    f.write(content)
+                    
+                # Añadir líneas en blanco para mejor separación
+                f.write("\n\n\n")
+            except Exception as e:
+                f.write(f"# ERROR: No se pudo leer el archivo: {e}\n\n")
+    
+    print(f"Código recopilado y guardado en: {output_file}")
+    return output_file
+
+def main():
+    # Obtener la ruta del proyecto (directorio actual)
+    project_path = os.path.dirname(os.path.abspath(__file__))
+    output_file = os.path.join(project_path, "project_code.txt")
+    
+    print(f"Recopilando código fuente del proyecto en: {project_path}")
+    py_files = collect_python_files(project_path)
+    print(f"Se encontraron {len(py_files)} archivos Python")
+    
+    saved_file = save_code_to_file(py_files, output_file)
+    print(f"Proceso completado. El código se ha guardado en: {saved_file}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+## ARCHIVO: setup.py
+## ==================================================
+
+from setuptools import setup, find_packages
+
+setup(
+    name="gatingdrl",
+    version="0.1.0",
+    description="Time Sensitive Networks Scheduling with Deep Reinforcement Learning",
+    author="jpazussa",
+    packages=find_packages(),
+    install_requires=[
+        "torch>=2.0.0",
+        "torch-geometric>=2.3.0",
+        "networkx>=3.0",
+        "matplotlib",
+        "pandas",
+        "numpy",
+        "gymnasium>=0.28.1",
+        "sb3-contrib>=2.0.0",
+        "stable-baselines3>=2.0.0",
+        "plotly>=5.14.0",
+    ],
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3.10",
+    ],
+    python_requires=">=3.10",
+)
+
+
+
+
+
+## ARCHIVO: tools/__init__.py
+## ==================================================
+
+
+
+
+## ARCHIVO: tools/analyze_training.py
+## ==================================================
+
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import argparse
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Añadir el directorio raíz al path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from tools.definitions import OUT_DIR
+
+def load_metrics(json_path=None):
+    """Carga métricas de un archivo .json de entrenamiento"""
+    if json_path is None:
+        # Buscar el último archivo metrics.json
+        metrics_files = [f for f in os.listdir(OUT_DIR) if f.startswith('training_metrics_') and f.endswith('.json')]
+        if not metrics_files:
+            print("No se encontraron archivos de métricas de entrenamiento")
+            return None
+        
+        # Ordenar por fecha de modificación y usar el más reciente
+        metrics_files.sort(key=lambda x: os.path.getmtime(os.path.join(OUT_DIR, x)), reverse=True)
+        json_path = os.path.join(OUT_DIR, metrics_files[0])
+    
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+        return data
+    except Exception as e:
+        print(f"Error cargando métricas: {e}")
+        return None
+
+def analyze_rewards(metrics, save_dir=None):
+    """Analiza y visualiza la evolución de recompensas"""
+    if not metrics or 'rewards' not in metrics:
+        print("No hay datos de recompensas disponibles")
+        return
+    
+    rewards = metrics['rewards']
+    if not rewards:
+        return
+    
+    plt.figure(figsize=(12, 6))
+    
+    # Gráfico de recompensa por episodio
+    plt.plot(rewards, 'b-', alpha=0.6)
+    
+    # Añadir suavizado (media móvil)
+    window = min(10, len(rewards) // 5 + 1)
+    if window > 1:
+        smooth_rewards = np.convolve(rewards, np.ones(window)/window, mode='valid')
+        valid_idx = np.arange(len(smooth_rewards)) + window - 1
+        plt.plot(valid_idx, smooth_rewards, 'r-', linewidth=2, label=f'Media móvil ({window} eps)')
+    
+    # Estadísticas de recompensas
+    plt.axhline(y=np.mean(rewards), color='g', linestyle='--', label=f'Media: {np.mean(rewards):.2f}')
+    
+    # Tramos de análisis
+    n = len(rewards)
+    if n >= 30:  # Solo si hay suficientes episodios
+        first_third = np.mean(rewards[:n//3])
+        mid_third = np.mean(rewards[n//3:2*n//3])
+        last_third = np.mean(rewards[2*n//3:])
+        
+        plt.axhline(y=first_third, color='c', linestyle=':', alpha=0.7, 
+                   label=f'Primer tercio: {first_third:.2f}')
+        plt.axhline(y=last_third, color='m', linestyle=':', alpha=0.7,
+                   label=f'Último tercio: {last_third:.2f}')
+        
+        # Indicar tendencia
+        if last_third > first_third * 1.1:
+            trend = "↗️ Mejora"
+        elif last_third < first_third * 0.9:
+            trend = "↘️ Deterioro"
+        else:
+            trend = "→ Estable"
+            
+        plt.text(0.02, 0.02, f"Tendencia: {trend}", transform=plt.gca().transAxes, 
+                bbox=dict(facecolor='white', alpha=0.8))
+    
+    plt.title('Evolución de Recompensas por Episodio', fontsize=14)
+    plt.xlabel('Episodio')
+    plt.ylabel('Recompensa')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(os.path.join(save_dir, 'rewards_analysis.png'))
+    
+    plt.show()
+
+def analyze_action_distribution(metrics, save_dir=None):
+    """Analiza la distribución de decisiones del agente"""
+    if not metrics or 'action_distributions' not in metrics:
+        print("No hay datos de distribuciones de acciones disponibles")
+        return
+    
+    action_dist = metrics.get('action_distributions', {})
+    if not action_dist:
+        return
+    
+    # Crear un DataFrame para análisis
+    action_data = {}
+    for action_name, dist in action_dist.items():
+        if isinstance(dist, dict):  # Asegurar que es un diccionario
+            action_data[action_name] = dist
+    
+    if not action_data:
+        return
+        
+    # Analizar cada dimensión de acción
+    plt.figure(figsize=(15, 10))
+    
+    n_actions = len(action_data)
+    n_cols = 2
+    n_rows = (n_actions + n_cols - 1) // n_cols
+    
+    action_names = {
+        "offset": "Offset temporal (µs)",
+        "gcl_strategy": "Estrategia GCL",
+        "guard_factor": "Guard factor",
+        "priority": "Prioridad",
+        "switch_gap": "Gap mínimo",
+        "jitter": "Control jitter"
+    }
+    
+    for i, (action, dist) in enumerate(action_data.items()):
+        plt.subplot(n_rows, n_cols, i+1)
+        
+        # Extraer valores y frecuencias
+        values = sorted(map(int, dist.keys()))
+        counts = [dist.get(str(v), 0) for v in values]
+        
+        # Calcular entropía normalizada para medir aleatoriedad
+        total = sum(counts)
+        if total > 0:
+            probs = [count/total for count in counts]
+            entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+            max_entropy = np.log2(len(values)) if len(values) > 0 else 0
+            norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
+            entropy_str = f"Entropía: {norm_entropy:.2f}"
+            
+            # Análisis de distribución
+            if norm_entropy > 0.95:
+                analysis = "Muy uniforme - posible indecisión"
+            elif norm_entropy > 0.85:
+                analysis = "Bastante uniforme - poca preferencia"
+            elif norm_entropy < 0.3:
+                analysis = "Muy concentrada - fuerte preferencia"
+            else:
+                analysis = "Distribución normal"
+        else:
+            entropy_str = ""
+            analysis = "Datos insuficientes"
+        
+        # Crear gráfico
+        plt.bar(values, counts)
+        plt.title(f"{action_names.get(action, action)}\n{entropy_str}\n{analysis}")
+        plt.xlabel("Valor")
+        plt.ylabel("Frecuencia")
+        plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        plt.savefig(os.path.join(save_dir, 'action_distribution.png'))
+    
+    plt.show()
+
+def analyze_correlation(metrics, save_dir=None):
+    """Analiza correlaciones entre decisiones y resultados"""
+    # Aquí se implementaría el análisis de correlación entre dimensiones
+    # y entre decisiones y rendimiento (recompensas)
+    pass
+
+def main():
+    parser = argparse.ArgumentParser(description='Analiza métricas de entrenamiento DRL')
+    parser.add_argument('--file', type=str, help='Ruta al archivo JSON de métricas (opcional)')
+    parser.add_argument('--save-dir', type=str, help='Directorio donde guardar los gráficos (opcional)')
+    parser.add_argument('--no-plots', action='store_true', help='No mostrar gráficos, solo guardarlos')
+    
+    args = parser.parse_args()
+    
+    # Cargar métricas
+    metrics = load_metrics(args.file)
+    if not metrics:
+        print("No se pudieron cargar las métricas")
+        return
+    
+    # Configurar backend de matplotlib
+    if args.no_plots:
+        plt.switch_backend('Agg')  # No mostrar gráficos
+    
+    # Realizar análisis
+    print("Analizando recompensas...")
+    analyze_rewards(metrics, args.save_dir)
+    
+    print("Analizando distribuciones de decisiones...")
+    analyze_action_distribution(metrics, args.save_dir)
+    
+    print("Análisis completado")
+
+if __name__ == "__main__":
+    main()
+
+
+
+## ARCHIVO: tools/definitions.py
+## ==================================================
+
+import os
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # newtas root directory
+
+OUT_DIR = os.path.join(ROOT_DIR, 'out')
+CONFIG_DIR = os.path.join(ROOT_DIR, 'config')
+
+LOG_DIR = os.path.join(OUT_DIR, 'log')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
+
+
+## ARCHIVO: tools/execute.py
+## ==================================================
+
+import argparse
+import inspect
+from typing import Any, Callable, List, Type, get_origin, get_args
+
+def custom_list_type(item_type: Type) -> Callable[[str], List[Any]]:
+    """
+    Generates a function to convert a comma-separated string into a list of a specific type.
+
+    Parameters
+    ----------
+    item_type : Type
+        The type of the items in the resulting list.
+
+    Returns
+    -------
+    Callable[[str], List[Any]]
+        A function that converts a string to a list of the specified item type.
+    """
+    def convert(s: str) -> List[Any]:
+        return [item_type(item) for item in s.split(',')]
+    return convert
+
+
+
+def execute_from_command_line(func: Callable):
+    """
+    Executes a given function using arguments provided from the command line.
+
+    This function uses the inspect module to determine the required and optional
+    arguments of the `func` function and their annotations. It then creates an
+    ArgumentParser object and adds the function's arguments to it.
+
+    The command-line arguments are expected to be provided in the format
+    `--arg_name arg_value`. The function arguments can be either required or
+    optional. If an optional argument is not provided, its default value from
+    the function definition is used.
+
+    After parsing the command-line arguments, this function calls `func` with
+    the parsed arguments.
+
+    Parameters
+    ----------
+    func : Callable
+        The function to be executed. This function can have any number of
+        required or optional arguments.
+
+    Raises
+    ------
+    argparse.ArgumentError
+        If a required argument is not provided in the command line.
+    """
+    # Get the signature of the function
+    sig = inspect.signature(func)
+
+    # Create the argument parser
+    parser = argparse.ArgumentParser(description=func.__doc__)
+
+    # Add arguments to the parser
+    for name, param in sig.parameters.items():
+        # Determine the type of the argument
+        if param.annotation is not param.empty:
+            arg_type = param.annotation
+            # Check if the annotation is a generic type
+            origin_type = get_origin(arg_type)
+            if origin_type is list:
+                # Get the inner type of the list
+                inner_type = get_args(arg_type)[0]
+                arg_type = custom_list_type(inner_type)
+        else:
+            arg_type = str
+
+        if param.default is param.empty:  # it's a required argument
+            parser.add_argument('--' + name, required=True, type=arg_type)
+        else:  # it's an optional argument, use default value from function definition
+            parser.add_argument('--' + name, default=param.default, type=arg_type)
+
+    args = parser.parse_args()
+
+    # Convert args to a dictionary
+    args_dict = vars(args)
+
+    # Call the function with the arguments
+    return func(**args_dict)
+
+
+
+## ARCHIVO: tools/log_config.py
+## ==================================================
+
+import logging
+
+# 1. ✅ Configura el logger de matplotlib.font_manager ANTES de importar matplotlib
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+
+# 2. ✅ Configura la fuente por defecto
+import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']  # Asegúrate de que esta fuente esté instalada
+# Eliminar el parámetro inválido font.cache_size
+# Verificar si el parámetro get_no_warn es válido
+try:
+    plt.rcParams['font.get_no_warn'] = True
+except KeyError:
+    # Ignorar si este parámetro tampoco es válido
+    pass
+
+# 3. Función para configurar el logging general
+def log_config(filename, level=logging.DEBUG):
+    # Configuración básica del logger raíz
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(filename, mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+    # 4. 🚨 Evita que matplotlib.font_manager herede el nivel DEBUG
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
+    
+
+
+## ARCHIVO: tools/schedule_report.py
+## ==================================================
+
+
+
+
+## ARCHIVO: ui/__init__.py
+## ==================================================
+
+"""
+Interfaces de usuario y visualización
+"""
+
+
+
+## ARCHIVO: ui/plot_training.py
+## ==================================================
+
+import matplotlib.pyplot as plt
+import os.path
+import sys
+
+# Añadir el directorio raíz al path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from stable_baselines3.common.results_plotter import plot_results
+from tools.execute import execute_from_command_line
+from tools.definitions import OUT_DIR
+
+
+def plot_training_rewards(dirname: str):
+    plot_results([dirname], None, 'timesteps', next((s for s in dirname.split(r'/') if '100' in s), None))
+    filename = os.path.join(os.path.dirname(dirname), f"training_reward.png")
+    print(f"saving the figure to {filename}")
+    plt.savefig(filename)
+    plt.show(block=False)
+    plt.pause(3)  # Espera 3 segundos para mostrar la gráfica
+    plt.close()
+
+
+if __name__ == '__main__': 
+    execute_from_command_line(plot_training_rewards)
+    
+
+
+## ARCHIVO: ui/show_schedule.py
+## ==================================================
+
+import argparse
+import os
+import glob
+import sys
+
+# Añadir el directorio raíz al path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tools.definitions import OUT_DIR
+
+
+
+def display_schedule_log(log_file=None, by_link=True):
+    """
+    Display the contents of a scheduling log file.
+    
+    Args:
+        log_file: Path to the log file. If None, displays the most recent log file.
+        by_link: If True, show logs organized by link, otherwise by flow.
+    """
+    if log_file is None:
+        # Find the most recent schedule_res log file
+        pattern = 'schedule_res_by_link_*.log' if by_link else 'schedule_res_*.log'
+        log_files = glob.glob(os.path.join(OUT_DIR, pattern))
+        if not log_files:
+            # Try the other format if no logs found
+            alt_pattern = 'schedule_res_*.log' if by_link else 'schedule_res_by_link_*.log'
+            log_files = glob.glob(os.path.join(OUT_DIR, alt_pattern))
+            if not log_files:
+                print("No scheduling log files found in", OUT_DIR)
+                return
+        log_file = max(log_files, key=os.path.getmtime)
+    
+    try:
+        with open(log_file, 'r') as f:
+            content = f.read()
+            
+        print("\n" + "="*80)
+        print(f"SCHEDULING DETAILS FROM: {os.path.basename(log_file)}")
+        print("="*80)
+        print(content)
+        print("="*80 + "\n")
+    except FileNotFoundError:
+        print(f"Error: Log file not found: {log_file}")
+    except Exception as e:
+        print(f"Error reading log file: {e}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Display scheduling log file contents")
+    parser.add_argument('--file', type=str, help='Path to specific log file (optional)')
+    parser.add_argument('--by-flow', action='store_true', help='Show logs organized by flow instead of by link')
+    
+    args = parser.parse_args()
+    display_schedule_log(args.file, not args.by_flow)
+
+
+
+## ARCHIVO: ui/test.py
+## ==================================================
+
+import logging
+import argparse
+import os
+import sys
+import random  # Añadido para corregir payloads
+import multiprocessing  # Añadido para detectar cores disponibles
+
+# Configure Qt to use offscreen rendering by default
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+# Añadir el directorio raíz al path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from tools.execute import execute_from_command_line
+from core.network.net import generate_flows, generate_graph, Network
+from core.scheduler.scheduler import DrlScheduler, ResAnalyzer
+from ui.tsn_visualizer_plotly import visualize_tsn_schedule_plotly  # Nuevo visualizador con Plotly
+from core.omnet_export import export_omnet_files                    # ← NUEVO
+
+DEFAULT_MIN_PAYLOAD = 64   # Valor por defecto mínimo razonable
+DEFAULT_MAX_PAYLOAD = 1518 # Valor por defecto máximo MTU
+
+def get_best_model_file(topo, alg='MaskablePPO'):
+    """Retorna la ruta completa al archivo del mejor modelo para la topología y algoritmo dados"""
+    from tools.definitions import OUT_DIR
+    return os.path.join(OUT_DIR, f"best_model_{topo}_{alg}", "best_model.zip")
+
+def test(topo: str, num_flows: int, num_envs: int = 0,
+         best_model_path: str = None, alg: str = 'MaskablePPO', link_rate: int = 100,
+         min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
+         visualize: bool = True, show_log: bool = True, gcl_threshold: int = 30):
+    
+    # Si num_envs es 0 o negativo, usar todos los cores disponibles
+    if num_envs <= 0:
+        num_envs = max(1, multiprocessing.cpu_count())
+        logging.info(f"Usando {num_envs} entornos en paralelo (núcleos CPU detectados)")
+    
+    # Configurar logging: INFO para consola, DEBUG para archivo
+    from tools.log_config import log_config
+    from tools.definitions import OUT_DIR
+    log_config(os.path.join(OUT_DIR, f'test_{topo}_{num_flows}.log'), level=logging.INFO)
+
+    # Siempre usar la ruta predeterminada para la topología y algoritmo
+    if best_model_path is None:
+        best_model_path = get_best_model_file(topo, alg)
+        logging.info(f"Usando modelo predeterminado: {best_model_path}")
+    
+    # Verificar si el archivo existe
+    if not os.path.exists(best_model_path):
+        logging.error(f"Error: Modelo no encontrado: {best_model_path}")
+        return False
+
+    graph = generate_graph(topo, link_rate)
+
+    # Generar flujos usando el rango de payload especificado
+    flows = generate_flows(graph, num_flows, unidirectional=(topo == "UNIDIR"), min_payload=min_payload, max_payload=max_payload) # Pasar min/max payload
+    
+    # Debug info: mostrar número de flujos generados
+    logging.info(f"Generados {len(flows)} flujos para topología {topo} (solicitados: {num_flows})")
+    
+    # Create network with ALL flows - no curriculum learning in test mode
+    network = Network(graph, flows)
+    
+    # Always use DrlScheduler with explicitly disabled curriculum learning
+    scheduler = DrlScheduler(network, num_envs=num_envs, use_curriculum=False)
+    
+    if best_model_path:
+        scheduler.load_model(best_model_path, alg)
+    
+    is_scheduled = scheduler.schedule()
+    
+    if is_scheduled:
+        # Debug info: mostrar número de flujos programados
+        schedule_res = scheduler.get_res()
+        scheduled_flows = set()
+        for link_ops in schedule_res.values():
+            for flow, _ in link_ops:
+                scheduled_flows.add(flow.flow_id)
+        
+        logging.info(f"Flujos programados: {len(scheduled_flows)} de {num_flows} solicitados")
+        
+        # Analizar y guardar logs detallados del scheduling
+        analyzer = ResAnalyzer(network, schedule_res)
+        
+        # Apply custom GCL threshold if provided
+        if gcl_threshold != 30:  # If different from default
+            analyzer.gap_threshold_us = gcl_threshold
+            analyzer.recalculate_gcl_tables(gcl_threshold)
+        
+        log_file = f'schedule_res_by_link_{analyzer.analyzer_id}.log'  # Usar el ID almacenado en el analizador
+        log_path = os.path.join(OUT_DIR, log_file)
+        logging.info(f"Schedule details saved to {log_path}")
+
+        # Imprimir información de flujos y tablas GCL estáticas
+        analyzer.print_flow_info()  # Mostrar tabla de flujos independientemente
+        
+        # Usar el método actualizado que solo muestra la tabla GCL generada
+        analyzer.print_gcl_tables()
+
+        # Mostrar el contenido del log de scheduling en la consola si se solicita
+        if show_log:
+            try:
+                if os.path.exists(log_path):
+                    with open(log_path, 'r') as f:
+                        log_content = f.read()
+                    print("\n" + "="*80)
+                    print("SCHEDULING DETAILS BY LINK:")
+                    print("="*80)
+                    print(log_content)
+                    print("="*80 + "\n")
+                else:
+                    logging.error(f"Archivo de log no encontrado: {log_path}")
+            except Exception as e:
+                logging.error(f"Error reading schedule log: {e}")
+        
+        if visualize:
+            # Try to visualize with error handling
+            try:
+                # Visualizar la programación usando Plotly (más estable)
+                save_path = os.path.join(OUT_DIR, f'tsn_schedule_{topo}_{num_flows}.html')
+                visualize_tsn_schedule_plotly(schedule_res, save_path)
+                
+                logging.info(f"Visualización interactiva guardada en {save_path}")
+            except Exception as e:
+                logging.error(f"Error durante la visualización: {e}")
+                logging.info("Continuando sin visualización interactiva.")
+
+        # ────────────────────────────────────────────────────────────────
+        #  NUEVO: exportar .ned y .ini cada vez que haya scheduling OK
+        # ────────────────────────────────────────────────────────────────
+        try:
+            ned_path, ini_path = export_omnet_files(
+                network,
+                schedule_res,
+                analyzer._gcl_tables,   # tablas ya calculadas
+                topo,
+                OUT_DIR
+            )
+            logging.info(f"OMNeT++ files escritos:\n  • {ned_path}\n  • {ini_path}")
+        except Exception as e:
+            logging.error(f"Error exportando ficheros OMNeT++: {e}")
+    else:
+        logging.error("Fail to find a valid solution.")
+
+    return is_scheduled
+
+
+if __name__ == '__main__':
+    # «resolve» evita choques de nombres si algún módulo añade flags
+    parser = argparse.ArgumentParser(conflict_handler="resolve")
+    parser.add_argument('--topo', type=str, required=True)
+    parser.add_argument('--num_flows', type=int, required=True)
+    parser.add_argument('--alg', type=str, default='MaskablePPO')
+    parser.add_argument('--link_rate', type=int, default=100)
+    # Añadir argumentos para min/max payload
+    parser.add_argument('--min-payload', type=int, default=DEFAULT_MIN_PAYLOAD, help=f"Tamaño mínimo de payload en bytes (default: {DEFAULT_MIN_PAYLOAD})")
+    parser.add_argument('--max-payload', type=int, default=DEFAULT_MAX_PAYLOAD, help=f"Tamaño máximo de payload en bytes (default: {DEFAULT_MAX_PAYLOAD})")
+    # ───────── NUEVA interfaz unificada ─────────
+    parser.add_argument('--dist', type=str, default='fixed',
+                        choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
+                        help='Distribución de separación de paquetes')
+    parser.add_argument('--dist-params', type=float, nargs='+', default=[],
+                        help='Parámetros de la distribución (ver README)')
+    parser.add_argument('--visualize', action='store_true', default=True,
+                        help='Generar visualización TSN')
+    parser.add_argument('--show-log', action='store_true', default=True, help='Mostrar detalles del scheduling en consola')
+    parser.add_argument('--gcl-threshold', type=int, default=30, 
+                        help='Threshold in µs for GCL entry generation')
+    # Se eliminó completamente el parámetro --best_model_path
+    
+    args = parser.parse_args()
+    
+    # Validar rango de payload
+    if args.min_payload > args.max_payload:
+        logging.error(f"Error: min-payload ({args.min_payload}) no puede ser mayor que max-payload ({args.max_payload})")
+        sys.exit(1)
+    if args.min_payload < 1 or args.max_payload < 1:
+        logging.error("Error: min-payload y max-payload deben ser >= 1")
+        sys.exit(1)
+
+    # 👉 Configurar la distribución global de separación entre paquetes
+    from core.network.net import Net
+    try:
+        Net.set_gap_distribution(args.dist, args.dist_params)
+    except (AssertionError, ValueError) as e:
+        logging.error(e)
+        sys.exit(1)
+
+    # La función test ahora determinará automáticamente la ruta del modelo y usará el rango de payload
+    test(args.topo, args.num_flows, 0,
+         None, args.alg, args.link_rate, 
+         min_payload=args.min_payload, max_payload=args.max_payload,
+         visualize=args.visualize, show_log=args.show_log,
+         gcl_threshold=args.gcl_threshold)  # Pass the threshold
+
+
+
+## ARCHIVO: ui/train.py
+## ==================================================
+
+import argparse
+import logging
+import matplotlib.pyplot as plt
+import multiprocessing
+import numpy as np
+import random
+import os
+import sys
+import shutil  # Para eliminar directorios recursivamente
+
+# Add Qt platform environment variable before any imports that might use Qt
+# This helps Qt find the correct platform plugin
+os.environ["QT_QPA_PLATFORM"] = "offscreen"  # Use offscreen rendering by default
+
+# Configurar el path antes de cualquier otra importación
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+#print(f"Set Python path to include: {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
+
+# Importar módulos desde rutas relativas
+from ui.test import test
+from tools.definitions import OUT_DIR, LOG_DIR  # Add LOG_DIR to import
+from core.learning.encoder import FeaturesExtractor
+# Importar MaskablePPO directamente
+from sb3_contrib import MaskablePPO
+from core.scheduler.scheduler import DrlScheduler
+from core.learning.environment import NetEnv # Eliminar TrainingNetEnv
+from tools.log_config import log_config
+from core.network.net import FlowGenerator, UniDirectionalFlowGenerator, generate_graph, Network
+from tools.definitions import OUT_DIR, LOG_DIR
+
+from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.results_plotter import load_results, ts2xy
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
+TOPO = 'SIMPLE'  # Cambiado de 'CEV' a 'SIMPLE' para coincidir con el valor por defecto
+
+# Usar siempre el número máximo de cores disponibles
+NUM_ENVS = max(1, multiprocessing.cpu_count())
+NUM_FLOWS = 50
+
+# Cambiar la definición del algoritmo a una constante fija
+DRL_ALG = 'MaskablePPO'
+
+MONITOR_ROOT_DIR = os.path.join(OUT_DIR, "monitor")
+
+DEFAULT_MIN_PAYLOAD = 64   # Valor por defecto mínimo razonable
+DEFAULT_MAX_PAYLOAD = 1518 # Valor por defecto máximo MTU
+
+
+def get_best_model_path(topo=TOPO, alg=DRL_ALG):
+    """Retorna la ruta al modelo entrenado según la topología y algoritmo"""
+    return os.path.join(OUT_DIR, f"best_model_{topo}_{alg}")
+
+def get_best_model_file(topo=TOPO, alg=DRL_ALG):
+    """Retorna la ruta completa al archivo del modelo (best_model.zip)"""
+    return os.path.join(get_best_model_path(topo, alg), "best_model.zip")
+
+
+def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True, link_rate: int = 100, 
+             min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
+             use_curriculum: bool = True):
+    def _init():
+        graph = generate_graph(topo, link_rate)
+
+        # Simplificar - eliminar jitters
+        # Use UniDirectionalFlowGenerator for UNIDIR topology
+        is_unidir = topo == "UNIDIR"
+        # Pasar el rango de payload al generador
+        if is_unidir:
+            flow_generator = UniDirectionalFlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
+        else:
+            flow_generator = FlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
+
+        # Generar todos los flujos - asegurarse de crear exactamente el número solicitado
+        flows = flow_generator(num_flows)
+        logging.info(f"Generados {len(flows)} flujos para {topo} (solicitados: {num_flows})")
+        
+        network = Network(graph, flows)
+        
+        # Crear entorno con curriculum learning adaptativo
+        env = NetEnv(
+            network, 
+            curriculum_enabled=use_curriculum,  
+            initial_complexity=0.25 if use_curriculum else 1.0,  # Si no hay curriculum, usar 100% de complejidad
+            curriculum_step=0.05      # Incrementar 5% por cada éxito
+        )
+
+        # Wrap the environment with Monitor
+        env = Monitor(env, os.path.join(monitor_dir, f'{"train" if training else "eval"}_{rank}'))
+        return env
+
+    return _init
+
+
+def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True):
+    # ────────────────────────────────────────────────────────────────
+    #  NUEVO: Limpiar completamente el directorio de salida
+    # ────────────────────────────────────────────────────────────────
+    if os.path.exists(OUT_DIR):
+        logging.info(f"Limpiando directorio de salida: {OUT_DIR}")
+        shutil.rmtree(OUT_DIR)
+    
+    # Recrear el directorio vacío
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)  # También recreamos LOG_DIR
+
+    # Siempre usar todos los cores disponibles
+    n_envs = NUM_ENVS
+    logging.info(f"Usando {n_envs} entornos en paralelo (núcleos CPU detectados: {multiprocessing.cpu_count()})")
+    
+    env = SubprocVecEnv([
+        # Ya no hay distinción entre entornos de entrenamiento y evaluación,
+        # ambos usan la configuración completa de num_flows desde el principio
+        make_env(num_flows, i, topo, monitor_dir, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=use_curriculum)  # Pasar flag de curriculum
+        for i in range(n_envs)
+        ])
+
+    if pre_trained_model is not None:
+        model = MaskablePPO.load(pre_trained_model, env)
+    else:
+        policy_kwargs = dict(
+            features_extractor_class=FeaturesExtractor,
+        )
+
+        # Usar siempre MaskablePPO sin condicionales
+        model = MaskablePPO("MlpPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
+
+    eval_env = SubprocVecEnv([
+        # El entorno de evaluación también usa la misma configuración
+        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False)  # Siempre desactivar curriculum en evaluación
+        for i in range(n_envs)
+        ])
+    
+    # Crear callback de evaluación y métricas
+    callbacks = [
+        EvalCallback(eval_env, 
+                   best_model_save_path=get_best_model_path(topo=topo, alg=DRL_ALG),
+                   log_path=OUT_DIR, 
+                   eval_freq=max(10000 // n_envs, 1))
+    ]
+
+    # Train the agent with just the eval callback
+    model.learn(total_timesteps=num_time_steps, callback=callbacks)
+
+    logging.info("Training complete.")
+
+    # NUEVO: Ejecutar un episodio final y guardar los detalles del scheduling
+    logging.info("Ejecutando episodio final para generar informe detallado...")
+    obs = env.reset()
+    done = False
+    final_info = None
+    
+    # Ejecutar un episodio completo con el modelo entrenado
+    while not done:
+        action_masks = np.vstack(env.env_method('action_masks'))
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks.astype(np.int8))
+        obs, _, dones, infos = env.step(action)
+        done = any(dones)
+        if done:
+            # Buscar información de éxito en algún entorno
+            for i, is_done in enumerate(dones):
+                if is_done and infos[i].get('success'):
+                    final_info = infos[i]
+                    break
+    
+    # Remove report generation code
+    if final_info and final_info.get('ScheduleRes'):
+        logging.info(f"Scheduling final exitoso con {len(final_info['ScheduleRes'])} enlaces programados")
+
+    logging.info("------Finish learning------")
+    return None  # Return None instead of metrics
+
+
+def moving_average(values, window):
+    """
+    Smooth values by doing a moving average
+    :param values: (numpy array)
+    :param window: (int)
+    :return: (numpy array)
+    """
+    weights = np.repeat(1.0, window) / window
+    return np.convolve(values, weights, "valid")
+
+
+def plot_results(log_folder, title="Learning Curve"):
+    """
+    plot the results
+
+    :param log_folder: (str) the save location of the results to plot
+    :param title: (str) the title of the task to plot
+    """
+    try:
+        x, y = ts2xy(load_results(log_folder), "timesteps")
+        y = moving_average(y, window=50)
+        # Truncate x
+        x = x[len(x) - len(y):]
+
+        fig = plt.figure(title)
+        plt.plot(x, y)
+        plt.xlabel("Number of Timesteps")
+        plt.ylabel("Rewards")
+        plt.title(title + " Smoothed")
+        plt.savefig(os.path.join(log_folder, "reward.png"))
+        
+        # Use non-blocking display and catch any errors
+        try:
+            plt.show(block=False)
+            plt.pause(3)  # Espera 3 segundos para mostrar la gráfica
+            plt.close()
+        except Exception as e:
+            logging.warning(f"Could not display plot interactively: {e}")
+            logging.info("Plot saved to file, continuing without interactive display.")
+    except Exception as e:
+        logging.error(f"Error plotting results: {e}")
+        logging.info("Continuing without plotting.")
+
+
+def main():
+    # Mover todas las declaraciones global al inicio de la función
+    global TOPO, NUM_ENVS, DRL_ALG
+    
+    # specify an existing model to train.
+    parser = argparse.ArgumentParser(conflict_handler="resolve")
+    parser.add_argument('--time_steps', type=int, required=True)
+    parser.add_argument('--num_flows', type=int, nargs='?', default=NUM_FLOWS)
+    parser.add_argument('--debug', action='store_true')
+    # Eliminar la opción de especificar num_envs, ahora es automático
+    parser.add_argument('--topo', type=str, default="SIMPLE", help="Topology type (e.g., SIMPLE, UNIDIR)")
+    parser.add_argument('--link_rate', type=int, default=100)
+    # Añadir argumentos para min/max payload
+    parser.add_argument('--min-payload', type=int, default=DEFAULT_MIN_PAYLOAD, help=f"Tamaño mínimo de payload en bytes (default: {DEFAULT_MIN_PAYLOAD})")
+    parser.add_argument('--max-payload', type=int, default=DEFAULT_MAX_PAYLOAD, help=f"Tamaño máximo de payload en bytes (default: {DEFAULT_MAX_PAYLOAD})")
+    # Cambio: Hacer --model opcional con un valor por defecto de None
+    parser.add_argument('--model', type=str, default=None, 
+                       help="Ruta opcional a un modelo pre-entrenado. Por defecto no carga ninguno.")
+    # ------------- argumentos para la separación probabilística -------------
+    parser.add_argument('--gap-mode', type=str, default='fixed',
+                        choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
+                        help="Modo de cálculo del gap en µs entre creaciones de paquetes")
+    parser.add_argument('--pkt-gap', type=int, default=0,
+                        help="• fixed ⇒ valor constante\n"
+                             "• exponential ⇒ media μ (λ = 1/μ)")
+    parser.add_argument('--gap-uniform', type=int, nargs=2, metavar=('MIN', 'MAX'),
+                        help="Sólo con --gap-mode uniform: intervalo [MIN,MAX]")
+    parser.add_argument('--gap-gauss', type=int, nargs=2, metavar=('MEAN','STD'),
+                        help="Sólo con --gap-mode gaussian: media μ y desvío σ (µs)")
+    parser.add_argument('--gap-pareto', type=float, nargs=2, metavar=('ALPHA','XM'),
+                        help="Sólo con --gap-mode pareto: shape α y scale xm")
+    # ------------- interfaz unificada de distribución de gaps ---------------
+    parser.add_argument('--dist', type=str, default='fixed',
+                        choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
+                        help="Tipo de distribución de separación de paquetes")
+    parser.add_argument('--dist-params', type=float, nargs='+', default=[],
+                        help="Parámetros numéricos de la distribución (ver doc)")
+    parser.add_argument('--arrival-dist', type=str, default='set',
+                        choices=['set', 'uniform', 'exponential'],
+                        help="Distribución para el período de cada flujo")
+    # Añadir opción para controlar el curriculum learning
+    parser.add_argument('--curriculum', action='store_true', default=True,
+                      help='Usar curriculum learning adaptativo (por defecto activado)')
+    parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
+                      help='Desactivar curriculum learning adaptativo')
+   
+    args = parser.parse_args()
+
+
+    if args.link_rate is not None:
+        support_link_rates = [100, 1000]
+        assert args.link_rate in support_link_rates, \
+            f"Unknown link rate {args.link_rate}, which is not in supported link rates {support_link_rates}"
+
+    # Validar rango de payload
+    if args.min_payload > args.max_payload:
+        logging.error(f"Error: min-payload ({args.min_payload}) no puede ser mayor que max-payload ({args.max_payload})")
+        sys.exit(1)
+    if args.min_payload < 1 or args.max_payload < 1:
+        logging.error("Error: min-payload y max-payload deben ser >= 1")
+        sys.exit(1)
+
+    # Eliminar procesamiento de jitters
+    TOPO = args.topo
+    # NUM_ENVS = args.num_envs  # Esta línea se elimina
+
+    # 👉 Aplicar el valor elegido antes de crear cualquier entorno
+    from core.network.net import Net
+    if args.pkt_gap < 0:
+        logging.error("Error: pkt-gap debe ser >= 0")
+        sys.exit(1)
+    # -------- aplicar configuración global del gap -------- #
+    Net.PACKET_GAP_MODE = args.gap_mode
+    if args.gap_mode == 'uniform':
+        if args.gap_uniform is None or len(args.gap_uniform) != 2:
+            logging.error("Debe proporcionar --gap-uniform MIN MAX con --gap-mode uniform")
+            sys.exit(1)
+        Net.PACKET_GAP_UNIFORM = tuple(args.gap_uniform)
+    Net.PACKET_GAP_EXTRA = max(args.pkt_gap, 0)
+
+    if args.gap_mode == 'gaussian':
+        if args.gap_gauss is None or len(args.gap_gauss) != 2:
+            logging.error("Debe proporcionar --gap-gauss MEAN STD con --gap-mode gaussian")
+            sys.exit(1)
+        Net.PACKET_GAP_GAUSS = tuple(args.gap_gauss)
+
+    if args.gap_mode == 'pareto':
+        if args.gap_pareto is None or len(args.gap_pareto) != 2:
+            logging.error("Debe proporcionar --gap-pareto ALPHA XM con --gap-mode pareto")
+            sys.exit(1)
+        Net.PACKET_GAP_PARETO = tuple(args.gap_pareto)
+
+    # -------- aplicar configuración global del gap -------- #
+    try:
+        Net.set_gap_distribution(args.dist, args.dist_params)
+    except AssertionError as e:
+        logging.error(e)
+        sys.exit(1)
+
+    log_config(os.path.join(OUT_DIR, f"train.log"), logging.DEBUG)
+
+    logging.info(args)
+
+    done = False
+    i = 0
+    MONITOR_DIR = None
+    while not done:
+        try:
+            MONITOR_DIR = os.path.join(MONITOR_ROOT_DIR, str(i))
+            os.makedirs(MONITOR_DIR, exist_ok=False)
+            done = True
+        except OSError:
+            i += 1
+            continue
+    assert MONITOR_DIR is not None
+
+    logging.info("start training...")
+    # metrics variable is ignored since it's now None
+    train(args.topo, args.time_steps,
+          MONITOR_DIR,  # Pasar MONITOR_DIR como parámetro
+          num_flows=args.num_flows,
+          pre_trained_model=args.model,  # Usar args.model (que podría ser None)
+          link_rate=args.link_rate,
+          min_payload=args.min_payload, # Pasar min/max payload
+          max_payload=args.max_payload,
+          use_curriculum=args.curriculum)
+
+    # Add try-except block around plotting
+    try:
+        plot_results(MONITOR_DIR)
+    except Exception as e:
+        logging.error(f"Error during plotting: {e}")
+        logging.info("Continuing without plotting.")
+
+    # Remove metrics summary code
+    logging.info(f"Training completed successfully.")
+
+    # Ya no necesitamos pasar la ruta del modelo, test la determinará automáticamente
+    test(args.topo, args.num_flows, NUM_ENVS, alg=DRL_ALG, link_rate=args.link_rate, min_payload=args.min_payload, max_payload=args.max_payload)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+## ARCHIVO: ui/tsn_visualizer_plotly.py
+## ==================================================
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+from core.network.net import Net
+import os
+import math
+import re
+import colorsys
+from collections import defaultdict
+import webbrowser
+import logging
+
+from tools.definitions import OUT_DIR
+from core.scheduler.scheduler import ScheduleRes
+
+def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
+    """
+    Genera una visualización interactiva de la programación TSN usando Plotly.
+    
+    Args:
+        schedule_res: Resultado de la programación
+        save_path: Ruta para guardar el HTML, por defecto es 'out/tsn_schedule_plotly.html'
+    """
+    if not schedule_res:
+        print("No hay resultados de programación para visualizar.")
+        return
+ 
+    
+    # Organizar datos por enlace
+    link_data = defaultdict(list)
+    all_periods = set()
+    all_flow_ids = set()
+    max_end_time = 0
+    
+    print("\nProcesando datos para visualización Plotly...")
+    
+    # ----- NUEVO: Extraer información de ocupación de switches -----
+    switch_busy_periods = defaultdict(list)
+    
+    # Extraer y procesar datos
+    for link, operations in schedule_res.items():
+        link_str = str(link)
+        match = re.search(r"Link\('([^']+)', '([^']+)'\)", link_str)
+        if not match:
+            print(f"Error: No se pudo extraer origen/destino de {link_str}")
+            continue
+        
+        src, dst = match.group(1), match.group(2)
+        link_name = f"{src} → {dst}"
+        
+        flow_ids = [flow.flow_id for flow, _ in operations]
+        print(f"Enlace: {link_name}, Flujos: {flow_ids}")
+        
+        for flow, operation in operations:
+            all_flow_ids.add(flow.flow_id)
+            all_periods.add(flow.period)
+            
+            # Calculate earliest_time on the fly based on the current Operation structure
+            earliest_time = operation.start_time if operation.gating_time is None else operation.gating_time
+            
+            link_data[link_name].append({
+                'flow_id': flow.flow_id,
+                'period': flow.period,
+                'start_time': operation.start_time,
+                'earliest_time': earliest_time,  # Computed value
+                'gating_time': operation.gating_time,
+                'latest_time': operation.latest_time,
+                'end_time': operation.end_time,
+                'reception_time': operation.reception_time,  # visualización
+                # ---- NEW: acción RL ----
+                'offset_idx': getattr(operation, 'offset_idx', None),
+                'offset_us' : getattr(operation, 'offset_us',  None),
+            })
+            
+            max_end_time = max(max_end_time, operation.end_time)
+            
+            # ACTUALIZADO: Extraer ocupación del switch si este enlace sale de un switch
+            if src.startswith('S') and not src.startswith('SRV'):
+                # El puerto del switch está ocupado durante la transmisión SOLAMENTE
+                # El switch termina de estar ocupado cuando el paquete sale completamente
+                guard_time = link.interference_time() if hasattr(link, "interference_time") else 1.22
+                switch_busy_start = earliest_time
+                switch_busy_end = operation.end_time  # CORREGIDO: Eliminar guard_time adicional
+                
+                # Almacenar período de ocupación para el switch
+                switch_busy_periods[src].append({
+                    'flow_id': flow.flow_id,
+                    'start': switch_busy_start,
+                    'end': switch_busy_end,  # El switch termina su trabajo cuando completa la transmisión
+                    'period': flow.period
+                })
+    
+    # Calcular el hiperperíodo
+    hyperperiod = 1
+    for period in all_periods:
+        hyperperiod = math.lcm(hyperperiod, period)
+    
+    print(f"Hiperperíodo calculado: {hyperperiod}µs")
+    
+    # Ordenar enlaces para visualización
+    # Considera como "switch-link" todo enlace cuyo **origen** sea S<n>
+    switch_links = [lnk for lnk in link_data.keys() if re.match(r'^S\d+\s+→', lnk)]
+    client_links = [lnk for lnk in link_data.keys() if lnk not in switch_links]
+    sorted_links = sorted(switch_links) + sorted(client_links)
+    
+    # --- TODOS los hops de switch van con gate ⇒ un solo esquema de colores ---
+    # IMPORTANTE: Definir flow_colors ANTES de cualquier referencia
+    flow_colors = {}
+    for i, flow_id in enumerate(sorted(all_flow_ids)):
+        hue = (i * 0.618033988749895) % 1
+        r, g, b = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
+        flow_colors[flow_id] = f'rgb({int(r*255)},{int(g*255)},{int(b*255)})'
+    
+    # ----- NUEVO: Añadir switches a la lista de elementos a visualizar -----
+    # Ordenar switches para mostrarlos primero
+    sorted_switches = sorted(switch_busy_periods.keys())
+    
+    # Crear figura de Plotly con subplots compartiendo el eje X
+    fig = make_subplots(
+        rows=3, 
+        cols=1,
+        row_heights=[0.15, 0.70, 0.15],  # Proporciones ajustadas para incluir switches
+        vertical_spacing=0.02,     # Reducir espacio entre gráficas para mejor integración visual
+        shared_xaxes=True,         # Compartir eje X para que el zoom se sincronice
+        subplot_titles=["Ocupación de Switches", "Programación de Flujos TSN", "Gate Control List (GCL)"]
+    )
+    
+    # -- NUEVO: SECCIÓN 1: OCUPACIÓN DE SWITCHES --
+    for i, switch_name in enumerate(sorted_switches):
+        periods = switch_busy_periods[switch_name]
+        
+        # Replicar períodos para todo el hiperperíodo
+        for period_info in periods:
+            flow_id = period_info['flow_id']
+            flow_period = period_info['period']
+            repetitions = hyperperiod // flow_period
+            
+            for rep in range(repetitions):
+                time_offset = rep * flow_period
+                start_time = period_info['start'] + time_offset
+                end_time = period_info['end'] + time_offset
+                duration = end_time - start_time
+                
+                # Añadir barra para el período ocupado
+                fig.add_trace(
+                    go.Bar(
+                        x=[duration],
+                        y=[switch_name],
+                        orientation='h',
+                        base=[start_time],
+                        name=f"{switch_name} ocupado ({flow_id})",
+                        marker=dict(
+                            color='rgba(150,150,150,0.7)',
+                            pattern=dict(
+                                shape="x",
+                                solidity=0.3,
+                                fgcolor="black"
+                            )
+                        ),
+                        showlegend=False,
+                        hoverinfo='text',
+                        hovertext=f"Switch: {switch_name}<br>Ocupado por flujo: {flow_id}<br>Inicio: {start_time}µs<br>Fin: {end_time}µs",
+                    ),
+                    row=1, col=1
+                )
+    
+    # -- SECCIÓN 2: GRÁFICO PRINCIPAL DE BARRAS (ahora en la segunda fila) --
+    # Recopilar eventos de GCL
+    gcl_events = []
+    for link, operations in schedule_res.items():
+        link_str = str(link)
+        match = re.search(r"Link\('([^']+)', '([^']+)'\)", link_str)
+        if not match:
+            continue
+        src, dst = match.group(1), match.group(2)
+        link_name = f"{src} → {dst}"
+        
+        # Solo procesar enlaces que salen de un switch
+        if not src.startswith('S'):
+            continue
+        
+        # Tratar todos los flujos como críticos para un GCL periódico
+        link_operations = operations
+        if link_operations:
+            print(f"Generando GCL periódico para enlace switch: {link_name}")
+            
+            # Calcular el hiperperíodo para todos los flujos
+            periods = [flow.period for flow, _ in link_operations]
+            hyperperiod_link = 1
+            for period in periods:
+                hyperperiod_link = math.lcm(hyperperiod_link, period)
+                
+            # Generar eventos GCL para todos los flujos con el mismo formato
+            # ------------------------------------------------------------------
+            # MODIFICACIÓN: Generar eventos "0" (cerrar) para TODOS los paquetes
+            # en su tiempo de recepción, sin filtrar por tamaño de gap.
+            # ------------------------------------------------------------------
+
+            # 1) Ordenar operaciones por inicio real de transmisión
+            ops_sorted = sorted(link_operations,
+                                key=lambda p: (p[1].gating_time or p[1].start_time))
+            n = len(ops_sorted)
+
+            if n < 2:
+                continue
+
+            # 2) Hiperperíodo individual del enlace
+            periods = [flow.period for flow, _ in ops_sorted]
+            hyperperiod_link = 1
+            for p in periods:
+                hyperperiod_link = math.lcm(hyperperiod_link, p)
+
+            # Variable para el umbral de gap (usado para filtrar qué eventos mostrar)
+            gap_thr_us = 50  # umbral de espacio mínimo para crear entradas GCL
+            
+            # PASO 1: Recopilar todos los tiempos de transmisión y recepción
+            all_transmission_times = []
+            all_reception_times = []
+            
+            # Recopilar todos los tiempos de transmisión y recepción
+            for i in range(n):
+                f_curr, op_curr = ops_sorted[i]
+                tx_start = op_curr.gating_time if op_curr.gating_time is not None else op_curr.start_time
+                # Para cada paquete, repetirlo durante todo el hiperperíodo
+                repetitions = hyperperiod_link // f_curr.period
+                for rep in range(repetitions):
+                    offset = rep * f_curr.period
+                    # Guardar tiempo de inicio y recepción (normalizado al hiperperíodo)
+                    tx_t = (tx_start + offset) % hyperperiod_link
+                    rx_t = (op_curr.reception_time + offset) % hyperperiod_link
+                    all_transmission_times.append((tx_t, f_curr.flow_id))
+                    all_reception_times.append((rx_t, f_curr.flow_id))
+            
+            # Ordenar los tiempos
+            all_transmission_times.sort(key=lambda x: x[0])
+            all_reception_times.sort(key=lambda x: x[0])
+            
+            # PASO 2: Generar eventos GCL analizando los gaps significativos
+            gcl_close_events = []  # Lista temporal para eventos de cierre (0)
+            
+            # Buscar gaps significativos entre recepción y siguiente transmisión
+            for i in range(len(all_reception_times)):
+                rx_time, rx_flow = all_reception_times[i]
+                
+                # Encontrar el siguiente tiempo de transmisión después de esta recepción
+                next_tx_time = None
+                next_tx_flow = None
+                
+                for tx_time, tx_flow in all_transmission_times:
+                    # Búsqueda circular (considerando el wraparound del hiperperíodo)
+                    if tx_time > rx_time:
+                        # Caso normal: siguiente TX está después de RX en este ciclo
+                        next_tx_time = tx_time
+                        next_tx_flow = tx_flow
+                        break
+                
+                # Si no se encontró ninguno, buscar el primero (wraparound)
+                if next_tx_time is None and all_transmission_times:
+                    next_tx_time = all_transmission_times[0][0] + hyperperiod_link
+                    next_tx_flow = all_transmission_times[0][1]
+                
+                # Calcular el gap (si hay transmisiones)
+                if next_tx_time is not None:
+                    gap = next_tx_time - rx_time
+                    if gap < 0:
+                        gap += hyperperiod_link  # Ajustar para gaps negativos (wraparound)
+                    
+                    # Solo considerar gaps que superen el umbral
+                    if gap > gap_thr_us:
+                        # Añadir eventos de cierre/apertura
+                        gcl_close_events.append((rx_time, rx_flow, next_tx_time, next_tx_flow))
+            
+            # PASO 3: Generar los pares de eventos 0/1 para cada gap significativo
+            for close_time, close_flow, next_tx_time, next_tx_flow in gcl_close_events:
+                # Calcular repeticiones para todo el hiperperíodo
+                repetitions = hyperperiod_link // hyperperiod_link  # Simplificado a 1
+                
+                for rep in range(repetitions):
+                    offset = rep * hyperperiod_link
+                    
+                    # Añadir evento de cierre (0) en el tiempo de recepción
+                    close_t = (close_time + offset) % hyperperiod_link
+                    gcl_events.append((close_t, 0, close_flow, link_name, True))
+                    
+                    # Añadir evento de apertura (1) EXACTAMENTE cuando empieza el siguiente paquete
+                    open_t = (next_tx_time + offset) % hyperperiod_link
+                    gcl_events.append((open_t, 1, next_tx_flow, link_name, True))
+
+    # Ordenar eventos por tiempo
+    gcl_events.sort(key=lambda x: x[0])
+    
+    # Para barras muy estrechas o marcadores de ventana de transmisión, mejorar visibilidad
+    for i, link_name in enumerate(sorted_links):
+        if (link_name not in link_data):
+            continue
+            
+        operations = link_data[link_name]
+        
+        for op_data in operations:
+            flow_id = op_data['flow_id']
+            flow_period = op_data['period']
+            repetitions = hyperperiod // flow_period
+            
+            for rep in range(repetitions):
+                # Calcular tiempos con el desplazamiento del período
+                time_offset = rep * flow_period
+                # Usar los tiempos recalculados si hubo offset
+                start_time = op_data['start_time'] + time_offset
+                end_time = op_data['end_time'] + time_offset
+                earliest_time = op_data['earliest_time'] + time_offset  # Use the computed value
+                latest_time = op_data['latest_time'] + time_offset
+                gating_time = op_data['gating_time'] + time_offset if op_data['gating_time'] is not None else None
+                reception_time = op_data['reception_time'] + time_offset if op_data['reception_time'] is not None else None
+
+                # Tiempo de transmisión real (desde gating_time o start_time si no hay gating)
+                actual_start_time = gating_time if gating_time is not None else start_time
+                transmission_duration = end_time - actual_start_time
+
+                # --- NUEVO: Barra de Tiempo de Espera con distinción de tipos ---
+                if gating_time is not None and gating_time > start_time:
+                    wait_duration = gating_time - start_time
+                    
+                    # Solo dibujamos la barra base gris (Total)
+                    fig.add_trace(
+                        go.Bar(
+                            x=[wait_duration],
+                            y=[link_name],
+                            orientation='h',
+                            base=[start_time],
+                            name="Espera Total",
+                            marker=dict(
+                                color='rgba(200,200,200,0.3)',
+                                line=dict(width=1, color='black'),
+                            ),
+                            showlegend=False,
+                            hoverinfo='none',
+                        ),
+                        row=2, col=1
+                    )
+
+                # ───────── BARRAS DE ESPERA DESGLOSADAS ─────────
+                if gating_time is not None and gating_time > start_time:
+                    wb = op.wait_breakdown   # dict con 'min_gap', 'other', 'total'
+
+                    # Dibujar la base gris con la espera total
+                    fig.add_trace(
+                        go.Bar(
+                            x=[wb['total']],
+                            y=[link_name],
+                            orientation='h',
+                            base=[start_time],
+                            name="Espera Total",
+                            marker=dict(color='rgba(200,200,200,0.25)'),
+                            showlegend=False,
+                            hoverinfo='none',
+                        ),
+                        row=2, col=1
+                    )
+
+                    waits = [
+                        # Solo las esperas controladas por RL
+                        ('min_gap', 'rgba(220, 20, 60,0.8)', "\\", "Separación mínima"),
+                        ('other',   'rgba(120,120,120,0.5)', "",   "Otros"),
+                    ]
+
+                    offset_acc = 0
+                    for key, color, pattern, label in waits:
+                        w = wb.get(key, 0)
+                        if w == 0:
+                            continue
+                        fig.add_trace(
+                            go.Bar(
+                                x=[w],
+                                y=[link_name],
+                                orientation='h',
+                                base=[start_time + offset_acc],
+                                name=label,
+                                marker=dict(color=color,
+                                            pattern=dict(shape=pattern, solidity=0.35)),
+                                showlegend=(rep == 0),
+                                legendgroup=f"wait_{key}",
+                                hoverinfo='text',
+                                hovertext=f"{label}: {w}µs<br>Flujo: {flow_id}",
+                            ),
+                            row=2, col=1
+                        )
+                        offset_acc += w
+
+                # Guard-band visualization removed
+
+                # --- Barra principal para transmisión ---
+                fig.add_trace(
+                    go.Bar(
+                        x=[transmission_duration],
+                        y=[link_name],
+                        orientation='h',
+                        base=[actual_start_time],
+                        name=flow_id,                    # sigue como texto interno
+                        marker=dict(
+                            color=flow_colors[flow_id],
+                            opacity=0.8,
+                            line=dict(width=1, color='black')
+                        ),
+                        text=flow_id,
+                        textposition='inside',
+                        insidetextanchor='middle',
+                        hoverinfo='text',
+                        hovertext=(
+                            f"Flujo: {flow_id}"
+                            f"<br>Período: {flow_period}µs"
+                            f"<br>Inicio Tx: {actual_start_time}µs"
+                            f"<br>Fin Tx: {end_time}µs"
+                            f"<br>Recibido: {reception_time}µs"
+                        ),
+                        showlegend=False,                # ← leyenda desactivada
+                    ),
+                    row=2, col=1
+                )
+
+                # Obtener detalles de las decisiones del agente si están disponibles
+                guard_factor = getattr(operation, 'guard_factor', 1.0)
+                min_gap = getattr(operation, 'min_gap_value', 1.0)
+                
+                # Tooltip completo con parámetros de RL
+                hover_text = (
+                    f"Flujo: {flow.flow_id}"
+                    f"<br>Período: {flow.period}µs"
+                    f"<br>Inicio Tx: {actual_start_time}µs"
+                    f"<br>Fin Tx: {end_time}µs"
+                    f"<br>Recibido: {reception_time}µs"
+                    f"<br>Guard Factor: {guard_factor:.2f}"
+                    f"<br>Separación Mín: {min_gap:.1f}µs"
+                )
+
+                # Marcadores ---
+                # Marcador para start_time (cuándo podría haber empezado)
+                fig.add_trace(
+                    go.Scatter(
+                        x=[start_time],
+                        y=[link_name],
+                        mode='markers',
+                        marker=dict(symbol='line-ns', size=15, color='green', line=dict(width=2)),
+                        name='Start Time (Available)',
+                        showlegend=False,
+                        hoverinfo='text',
+                        hovertext=f"Disponible (Start Time): {start_time}µs<br>Flujo: {flow_id}",
+                    ),
+                    row=2, col=1
+                )
+
+                # Marcador para gating_time (cuándo empezó realmente si hubo gating)
+                if gating_time is not None:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[gating_time],
+                            y=[link_name],
+                            mode='markers',
+                            marker=dict(symbol='line-ns', size=18, color='red', line=dict(width=3)),
+                            name='Gate Time (Actual Start)',
+                            showlegend=False,
+                            hoverinfo='text',
+                            hovertext=f"Inicio Real (Gate Time): {gating_time}µs<br>Flujo: {flow_id}",
+                        ),
+                        row=2, col=1
+                    )
+
+                # Marcador para latest_time (límite ventana gating)
+                # Solo relevante si hay gating
+                if gating_time is not None:
+                    fig.add_trace(
+                        go.Scatter(
+                            x=[latest_time],
+                            y=[link_name],
+                            mode='markers',
+                            marker=dict(symbol='line-ns', size=15, color='orange', line=dict(width=2)),
+                            name='Latest Time',
+                            showlegend=False,
+                            hoverinfo='text',
+                            hovertext=f"Latest Time: {latest_time}µs<br>Flujo: {flow_id}",
+                        ),
+                        row=2, col=1
+                    )
+    
+    # -- SECCIÓN 3: REPRESENTACIÓN DEL GCL (ahora en la tercera fila) --
+    if gcl_events:
+        print(f"Dibujando {len(gcl_events)} eventos GCL")
+        
+        # Crear representación del GCL como un gráfico mejorado
+        gcl_times = []
+        gcl_values = []
+        gcl_texts = []
+        gcl_colors = []
+        
+        # Debug adicional para identificar el problema
+        print("\nDETALLE DE EVENTOS GCL ORDENADOS:")
+        print(f"{'Tiempo':8} | {'Estado':6} | {'Flujo':5} | {'Tipo':10}")
+        print(f"{'-'*8} | {'-'*6} | {'-'*5} | {'-'*10}")
+        
+        # Mostrar eventos de cierre (0) Y apertura (1)
+        for time, state, flow_id, link_name, is_gating in gcl_events:
+            tipo = "Gated" if is_gating else "Non-Gated"
+            print(f"{time:8} | {state:6} | {flow_id:5} | {tipo:10}")
+            
+            gcl_times.append(time)
+            gcl_values.append(state)  # Incluir ambos estados: 0 y 1
+            
+            event_type = "Cierre" if state == 0 else "Apertura"
+            gcl_texts.append(f"{event_type} de gate<br>Tiempo: {time}µs<br>Flujo: {flow_id}<br>Tipo: {tipo}")
+            # Azul para estado 0 (cierre), Verde para estado 1 (apertura)
+            gcl_colors.append('rgba(0,0,255,0.9)' if state == 0 else 'rgba(0,180,0,0.9)')
+
+        # ------------------------------------------------------------------
+        #  MOSTRAR TABLA GCL EN CONSOLA PARA VERIFICACIÓN RÁPIDA
+        # ------------------------------------------------------------------
+        print("\n" + "="*60)
+        print("TABLA GCL GENERADA (t, estado)")
+        print("-"*60)
+        for t, v in zip(gcl_times, gcl_values):
+            print(f"{t:>8} µs | {v}")
+        print("="*60 + "\n")
+        
+        # Línea para conectar los eventos GCL y hacerlos más visibles
+        fig.add_trace(
+            go.Scatter(
+                x=gcl_times,
+                y=['GCL'] * len(gcl_times),
+                mode='lines',
+                line=dict(color='lightgray', width=1.5, dash='dot'),
+                showlegend=False,
+                hoverinfo='none'
+            ),
+            row=3, col=1
+        )
+        
+        # Dibujar los eventos GCL con texto forzado para distinguir entre 0 y 1
+        fig.add_trace(
+            go.Scatter(
+                x=gcl_times,
+                y=['GCL'] * len(gcl_times),
+                mode='markers+text',
+                marker=dict(
+                    size=15,  # Tamaño fijo para todos los eventos
+                    color=gcl_colors,
+                    symbol='circle',
+                    line=dict(width=2, color='black')
+                ),
+                text=[str(v) for v in gcl_values],  # Mostrar "0" o "1" según el valor
+                textposition='middle center',
+                textfont=dict(color='white', size=10, family='Arial Black'),
+                name='GCL Events',
+                showlegend=False,
+                hoverinfo='text',
+                hovertext=gcl_texts,
+            ),
+            row=3, col=1
+        )
+    else:
+        # Si no hay eventos GCL, mostrar un mensaje
+        fig.add_annotation(
+            x=hyperperiod/2,
+            y=0,
+            text="No hay eventos GCL para mostrar",
+            showarrow=False,
+            font=dict(size=12, color="gray"),
+            row=3, col=1
+        )
+    
+    # Añadir línea vertical para el hiperperíodo
+    fig.add_vline(
+        x=hyperperiod,
+        line_width=2,
+        line_dash="solid",
+        line_color="blue",
+        annotation_text=f"Hiperperíodo: {hyperperiod}µs",
+        annotation_position="top",
+        annotation_font_size=12,
+        annotation_font_color="blue"
+    )
+    
+    # Configuración de diseño mejorada para ocupar toda la página
+    fig.update_layout(
+        title=f"Programación TSN de Flujos (Hiperperíodo: {hyperperiod}µs)",
+        barmode='overlay',
+        height=max(800, len(sorted_links) * 45 + 250),  # Altura ajustada para mejor visualización
+        width=1400,                                     # Ancho aumentado para mejor visualización
+        margin=dict(l=50, r=50, t=80, b=80),           # Márgenes reducidos
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.18,                                    # Ajustar posición de leyenda
+            xanchor="center",
+            x=0.5,
+            title="Flujos"
+        ),
+        plot_bgcolor='white',
+        hovermode='closest',
+    )
+    
+    # Agregar leyenda interactiva para filtrar por tipo de evento
+    fig.update_layout(
+        legend=dict(
+            title="Tipo de evento",
+            orientation="h",
+            yanchor="bottom",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+        )
+    )
+    
+    # Vincular los ejes X para que el zoom se sincronice entre gráficas
+    tick_interval = max(100, hyperperiod // 20)  # máx. 20 ticks
+    fig.update_xaxes(
+        title="Tiempo (µs)",
+        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        gridcolor='lightgray',
+        griddash='dot',
+        tickvals=list(range(0, hyperperiod + tick_interval, tick_interval)),
+        row=1, col=1
+    )
+    
+    fig.update_xaxes(
+        title="Tiempo (µs)",
+        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        showgrid=True,
+        gridcolor='lightgray',
+        griddash='dot',
+        tickvals=list(range(0, hyperperiod + tick_interval, tick_interval)),
+        row=2, col=1,
+        matches='x'  # Esto sincroniza este eje con el eje X de la primera gráfica
+    )
+    
+    fig.update_xaxes(
+        title="Tiempo (µs)",
+        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        showgrid=True,
+        gridcolor='lightgray',
+        griddash='dot',
+        tickvals=list(range(0, hyperperiod + tick_interval, tick_interval)),
+        row=3, col=1,
+        matches='x'  # Esto sincroniza este eje con el eje X de la primera gráfica
+    )
+    
+    # Mejorar el estilo de las etiquetas del eje Y
+    fig.update_yaxes(
+        title="Switches",
+        row=1, col=1,
+        linecolor='black',
+        gridcolor='rgba(200,200,200,0.3)'
+    )
+    
+    fig.update_yaxes(
+        title="Enlaces",
+        row=2, col=1,
+        linecolor='black',
+        gridcolor='rgba(200,200,200,0.3)'
+    )
+    
+    # Manejo especial para el eje Y del GCL
+    fig.update_yaxes(
+        showticklabels=True,                # Mostrar etiquetas
+        tickvals=['GCL'],                   # Establecer valores específicos
+        ticktext=['GCL'],                   # Establecer texto para esos valores
+        row=3, col=1,
+        linecolor='black',
+        gridcolor='rgba(200,200,200,0.3)'
+    )
+    
+    # Agregar leyenda adicional para símbolos
+    symbols_legend = [
+        dict(name="Disponible (Start)", marker=dict(color="green", symbol="line-ns", size=10)),
+        dict(name="Inicio Real (Gate)", marker=dict(color="red", symbol="line-ns", size=10)),
+        dict(name="Último Inicio (Latest)", marker=dict(color="orange", symbol="line-ns", size=10)),
+        dict(name="Espera por FCFS/Switch Ocupado", marker=dict(color="rgba(100,100,255,0.7)", symbol="square", size=10)),
+        dict(name="Espera por Separación Mínima", marker=dict(color="rgba(220,20,60,0.7)", symbol="square", size=10)),
+    ]
+    
+    for item in symbols_legend:
+        # Asegurarse de que el marcador no contenga 'pattern'
+        marker_config = item.get('marker', {})
+        if 'pattern' in marker_config:
+             del marker_config['pattern'] # Eliminar si existe por error
+                
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode='markers',
+                marker=marker_config, # Usar la configuración corregida
+                name=item.get('name', ''),
+                showlegend=True
+            )
+        )
+    
+    # Agregar leyenda para la ocupación de switches
+    fig.add_trace(
+        go.Bar(
+            x=[None],
+            y=[None],
+            name="Switch Ocupado",
+            marker=dict(
+                color='rgba(150,150,150,0.7)',
+                pattern=dict(shape="x", solidity=0.3, fgcolor="black")
+            ),
+            showlegend=True
+        )
+    )
+    
+    # ── leyendas limpiadas: sólo min-gap (decisión RL) ──
+    fig.add_trace(
+        go.Bar(
+            x=[None], y=[None], name="Espera ▸ min-gap",
+            marker=dict(color='rgba(220, 20, 60,0.8)',
+                        pattern=dict(shape="\\", solidity=0.35)),
+            showlegend=True)
+    )
+    
+    # Guardar como HTML interactivo con opciones para mejor visualización
+    if save_path is None:
+        save_path = os.path.join(OUT_DIR, 'tsn_schedule_plotly.html')
+    
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.write_html(
+        save_path,
+        include_plotlyjs='cdn',
+        full_html=True,
+        include_mathjax='cdn',
+        config={
+            'scrollZoom': True,            # Permitir zoom con rueda del ratón
+            'displayModeBar': True,        # Mostrar barra de herramientas
+            'displaylogo': False,          # No mostrar logo de Plotly
+            'toImageButtonOptions': {      # Configuración para guardar imagen
+                'format': 'png',
+                'filename': 'tsn_schedule',
+                'height': 1200,
+                'width': 1800,
+                'scale': 2                 # Alta resolución
+            }
+        }
+    )
+    print(f"Visualización interactiva TSN guardada en: {save_path}")
+    
+    # Try to open in browser with error handling
+    try:
+        webbrowser.open('file://' + os.path.abspath(save_path))
+    except Exception as e:
+        logging.warning(f"Could not open browser automatically: {e}")
+        print(f"Please open the visualization manually at: file://{os.path.abspath(save_path)}")
+    
+    return fig
+
+def visualize_lcm_cycle_plotly(schedule_res: ScheduleRes, save_path=None):
+    """
+    Función de compatibilidad que redirige a visualize_tsn_schedule_plotly
+    """
+    print("La funcionalidad de visualización del hiperperíodo está integrada en visualize_tsn_schedule_plotly.")
+    print("Llamando a visualize_tsn_schedule_plotly...")
+    return visualize_tsn_schedule_plotly(schedule_res, save_path)
+
+if __name__ == "__main__":
+    print("Este módulo debe ser importado y utilizado desde test.py")
+    print("Ejemplo: visualize_tsn_schedule_plotly(scheduler.get_res())")
+
+
+
