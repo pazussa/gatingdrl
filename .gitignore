@@ -32,7 +32,10 @@ ENV/
 *.swo
 
 # Output files
-/out/
+/out/*
+# But include these specific files/directories
+!/out/README.md
+!/out/.gitkeep
 
 # Logs
 *.log
