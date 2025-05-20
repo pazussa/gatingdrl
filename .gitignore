@@ -32,9 +32,9 @@ ENV/
 *.swo
 
 # Output files
+# Ignorar todos los archivos en out/ pero no la carpeta en sí
 /out/*
-# But include these specific files/directories
-!/out/README.md
+# No ignorar este archivo para mantener la carpeta
 !/out/.gitkeep
 
 # Logs
