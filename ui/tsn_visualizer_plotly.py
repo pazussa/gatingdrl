@@ -10,6 +10,7 @@ from collections import defaultdict
 import webbrowser
 import logging
 
+
 from tools.definitions import OUT_DIR
 from core.scheduler.scheduler import ScheduleRes
 
@@ -37,6 +38,9 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     # ----- NUEVO: Extraer información de ocupación de switches -----
     switch_busy_periods = defaultdict(list)
     
+    # Track which legend entries have been shown globally
+    legend_shown = set()
+    
     # Extraer y procesar datos
     for link, operations in schedule_res.items():
         link_str = str(link)
@@ -58,18 +62,23 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             # Calculate earliest_time on the fly based on the current Operation structure
             earliest_time = operation.start_time if operation.gating_time is None else operation.gating_time
             
+            # Guardamos también el guard-band y el desglose de esperas
             link_data[link_name].append({
-                'flow_id': flow.flow_id,
-                'period': flow.period,
-                'start_time': operation.start_time,
-                'earliest_time': earliest_time,  # Computed value
-                'gating_time': operation.gating_time,
-                'latest_time': operation.latest_time,
-                'end_time': operation.end_time,
-                'reception_time': operation.reception_time,  # visualización
-                # ---- NEW: acción RL ----
-                'offset_idx': getattr(operation, 'offset_idx', None),
-                'offset_us' : getattr(operation, 'offset_us',  None),
+                'flow_id'        : flow.flow_id,
+                'period'         : flow.period,
+                'start_time'     : operation.start_time,
+                'earliest_time'  : earliest_time,          # calculado
+                'gating_time'    : operation.gating_time,
+                'latest_time'    : operation.latest_time,
+                'end_time'       : operation.end_time,
+                'reception_time' : operation.reception_time,
+                # ➊ NUEVOS campos → visualización de bloques temporales
+                'guard_time'     : getattr(operation, 'guard_time', 0),
+                'wait_breakdown' : operation.wait_breakdown,
+                'min_gap_wait'   : getattr(operation, 'min_gap_wait', 0),
+                # ---- acción RL (se mantiene) ----
+                'offset_idx'     : getattr(operation, 'offset_idx', None),
+                'offset_us'      : getattr(operation, 'offset_us',  None),
             })
             
             max_end_time = max(max_end_time, operation.end_time)
@@ -78,9 +87,10 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             if src.startswith('S') and not src.startswith('SRV'):
                 # El puerto del switch está ocupado durante la transmisión SOLAMENTE
                 # El switch termina de estar ocupado cuando el paquete sale completamente
-                guard_time = link.interference_time() if hasattr(link, "interference_time") else 1.22
                 switch_busy_start = earliest_time
-                switch_busy_end = operation.end_time  # CORREGIDO: Eliminar guard_time adicional
+                # Mostrar la ocupación real del puerto: transmisión + guard-band
+                guard_time = link.interference_time() if hasattr(link, "interference_time") else 1.22
+                switch_busy_end = operation.end_time + guard_time
                 
                 # Almacenar período de ocupación para el switch
                 switch_busy_periods[src].append({
@@ -89,13 +99,20 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                     'end': switch_busy_end,  # El switch termina su trabajo cuando completa la transmisión
                     'period': flow.period
                 })
-    
+
+
     # Calcular el hiperperíodo
     hyperperiod = 1
     for period in all_periods:
         hyperperiod = math.lcm(hyperperiod, period)
     
     print(f"Hiperperíodo calculado: {hyperperiod}µs")
+
+    # ▸ valor máximo de Δsw  →  nos permite ampliar el eje-X hacia la izquierda
+    global_max_gap = max(
+        (op['min_gap_wait'] for link_ops in link_data.values() for op in link_ops),
+        default=0
+    )
     
     # Ordenar enlaces para visualización
     # Considera como "switch-link" todo enlace cuyo **origen** sea S<n>
@@ -340,7 +357,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
 
                 # ───────── BARRAS DE ESPERA DESGLOSADAS ─────────
                 if gating_time is not None and gating_time > start_time:
-                    wb = op.wait_breakdown   # dict con 'min_gap', 'other', 'total'
+                    wb = op_data['wait_breakdown']          # dict: min_gap / other / total
 
                     # Dibujar la base gris con la espera total
                     fig.add_trace(
@@ -368,6 +385,13 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                         w = wb.get(key, 0)
                         if w == 0:
                             continue
+                        
+                        # Check if this legend entry has been shown before
+                        legend_key = f"wait_{key}"
+                        show_legend = legend_key not in legend_shown
+                        if show_legend:
+                            legend_shown.add(legend_key)
+                            
                         fig.add_trace(
                             go.Bar(
                                 x=[w],
@@ -377,16 +401,105 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                                 name=label,
                                 marker=dict(color=color,
                                             pattern=dict(shape=pattern, solidity=0.35)),
-                                showlegend=(rep == 0),
-                                legendgroup=f"wait_{key}",
+                                showlegend=show_legend,
+                                legendgroup=legend_key,
                                 hoverinfo='text',
-                                hovertext=f"{label}: {w}µs<br>Flujo: {flow_id}",
+                                hovertext=f"{label}: {w} µs<br>Flujo: {flow_id}",
                             ),
                             row=2, col=1
                         )
                         offset_acc += w
 
-                # Guard-band visualization removed
+                # ---------------------------------------------------------------
+                #  BLOQUE 2 · ESPERA EN EL SWITCH  (Δsw y resto de waits)
+                # ---------------------------------------------------------------
+                wb = op_data['wait_breakdown']
+                # ▶️  dibujamos SIEMPRE que exista min_gap_wait, con o sin gating
+                if op_data['min_gap_wait'] > 0 and not wb:
+                    # reconstruir diccionario vacío
+                    wb = {'min_gap': op_data['min_gap_wait'],
+                          'other'  : 0,
+                          'total'  : op_data['min_gap_wait']}
+
+                if wb:
+                    # Dibujar la base gris con la espera total
+                    fig.add_trace(
+                        go.Bar(
+                            x=[wb['total']],
+                            y=[link_name],
+                            orientation='h',
+                            base=[start_time],
+                            name="Espera Total",
+                            marker=dict(color='rgba(200,200,200,0.25)'),
+                            showlegend=False,
+                            hoverinfo='none',
+                        ),
+                        row=2, col=1
+                    )
+
+                    waits = [
+                        ('min_gap', 'rgba(220, 20, 60,0.8)', "\\", "Δ sw   (gap mín.)"),
+                        ('other',   'rgba(120,120,120,0.5)', "",   "Otros"),
+                    ]
+
+                    offset_acc = 0
+                    for key, color, pattern, label in waits:
+                        w = wb.get(key, 0)
+                        if w == 0:
+                            continue
+                            
+                        # Check if this legend entry has been shown before
+                        legend_key = f"wait_{key}"
+                        show_legend = legend_key not in legend_shown
+                        if show_legend:
+                            legend_shown.add(legend_key)
+                            
+                        fig.add_trace(
+                            go.Bar(
+                                x=[w],
+                                y=[link_name],
+                                orientation='h',
+                                base=[start_time + offset_acc],
+                                name=label,
+                                marker=dict(color=color,
+                                            pattern=dict(shape=pattern, solidity=0.35)),
+                                showlegend=show_legend,
+                                legendgroup=legend_key,
+                                hoverinfo='text',
+                                hovertext=f"{label}: {w} µs<br>Flujo: {flow_id}",
+                            ),
+                            row=2, col=1
+                        )
+                        offset_acc += w
+
+                # ---------------------------------------------------------------
+                #  BLOQUE 3 · GUARD-BAND  (γe·dmax)
+                # ---------------------------------------------------------------
+                guard_time = op_data['guard_time']
+                if guard_time > 0:
+                    # Check if guard-band legend has been shown before
+                    show_guard_legend = "guard_band" not in legend_shown
+                    if show_guard_legend:
+                        legend_shown.add("guard_band")
+                        
+                    fig.add_trace(
+                        go.Bar(
+                            x=[guard_time],
+                            y=[link_name],
+                            orientation='h',
+                            base=[end_time],
+                            name="Guard-band",
+                            legendgroup="guard_band",
+                            marker=dict(
+                                color='rgba(30,144,255,0.5)',
+                                pattern=dict(shape="/", solidity=0.35)
+                            ),
+                            showlegend=show_guard_legend,
+                            hoverinfo='text',
+                            hovertext=f"Guard-band: {guard_time} µs<br>Flujo: {flow_id}",
+                        ),
+                        row=2, col=1
+                    )
 
                 # --- Barra principal para transmisión ---
                 fig.add_trace(
@@ -481,90 +594,73 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                         row=2, col=1
                     )
     
-    # -- SECCIÓN 3: REPRESENTACIÓN DEL GCL (ahora en la tercera fila) --
-    if gcl_events:
-        print(f"Dibujando {len(gcl_events)} eventos GCL")
-        
-        # Crear representación del GCL como un gráfico mejorado
-        gcl_times = []
-        gcl_values = []
-        gcl_texts = []
-        gcl_colors = []
-        
-        # Debug adicional para identificar el problema
-        print("\nDETALLE DE EVENTOS GCL ORDENADOS:")
-        print(f"{'Tiempo':8} | {'Estado':6} | {'Flujo':5} | {'Tipo':10}")
-        print(f"{'-'*8} | {'-'*6} | {'-'*5} | {'-'*10}")
-        
-        # Mostrar eventos de cierre (0) Y apertura (1)
-        for time, state, flow_id, link_name, is_gating in gcl_events:
-            tipo = "Gated" if is_gating else "Non-Gated"
-            print(f"{time:8} | {state:6} | {flow_id:5} | {tipo:10}")
-            
-            gcl_times.append(time)
-            gcl_values.append(state)  # Incluir ambos estados: 0 y 1
-            
-            event_type = "Cierre" if state == 0 else "Apertura"
-            gcl_texts.append(f"{event_type} de gate<br>Tiempo: {time}µs<br>Flujo: {flow_id}<br>Tipo: {tipo}")
-            # Azul para estado 0 (cierre), Verde para estado 1 (apertura)
-            gcl_colors.append('rgba(0,0,255,0.9)' if state == 0 else 'rgba(0,180,0,0.9)')
+    # -- SECCIÓN 3 (GCL): una fila por switch --------------------------------
+    #  ① Agrupamos los eventos por switch   →  gcl_by_switch[src] = [...]
+    #  ② Para cada switch añadimos *dos* trazas (línea punteada + markers)
 
-        # ------------------------------------------------------------------
-        #  MOSTRAR TABLA GCL EN CONSOLA PARA VERIFICACIÓN RÁPIDA
-        # ------------------------------------------------------------------
-        print("\n" + "="*60)
-        print("TABLA GCL GENERADA (t, estado)")
-        print("-"*60)
-        for t, v in zip(gcl_times, gcl_values):
-            print(f"{t:>8} µs | {v}")
-        print("="*60 + "\n")
-        
-        # Línea para conectar los eventos GCL y hacerlos más visibles
-        fig.add_trace(
-            go.Scatter(
-                x=gcl_times,
-                y=['GCL'] * len(gcl_times),
-                mode='lines',
-                line=dict(color='lightgray', width=1.5, dash='dot'),
-                showlegend=False,
-                hoverinfo='none'
-            ),
-            row=3, col=1
-        )
-        
-        # Dibujar los eventos GCL con texto forzado para distinguir entre 0 y 1
-        fig.add_trace(
-            go.Scatter(
-                x=gcl_times,
-                y=['GCL'] * len(gcl_times),
-                mode='markers+text',
-                marker=dict(
-                    size=15,  # Tamaño fijo para todos los eventos
-                    color=gcl_colors,
-                    symbol='circle',
-                    line=dict(width=2, color='black')
+    # gcl_events se genera más arriba; aquí lo re-estructuramos:
+    gcl_by_switch = defaultdict(list)
+    for t, state, flow_id, link_name, is_gating in gcl_events:
+        # el nombre de la fila será, p.ej.,  "GCL S1"
+        src_sw = link_name.split(' ')[0]          # 'S1' de "S1 → SRV1"
+        gcl_by_switch[src_sw].append((t, state, flow_id, is_gating))
+
+    if gcl_by_switch:
+        print(f"Dibujando GCL para {len(gcl_by_switch)} switches")
+        # Aseguramos orden estable
+        for sw_name in sorted(gcl_by_switch.keys()):
+            events = sorted(gcl_by_switch[sw_name], key=lambda x: x[0])
+            if not events:
+                continue
+
+            # Descomponer para construir arrays
+            times   = [e[0] for e in events]
+            states  = [e[1] for e in events]
+            colors  = ['rgba(0,0,255,0.9)' if s == 0 else 'rgba(0,180,0,0.9)'
+                       for s in states]
+            htexts  = [("Cierre" if s == 0 else "Apertura") +
+                       f"<br>{sw_name}<br>t={t}µs<br>Flujo={f}"
+                       for (t, s, f, _) in events]
+
+            # Línea guía (gris) para esa fila
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=[f"GCL {sw_name}"]*len(times),
+                    mode='lines',
+                    line=dict(color='lightgray', width=1.5, dash='dot'),
+                    showlegend=False,
+                    hoverinfo='none',
                 ),
-                text=[str(v) for v in gcl_values],  # Mostrar "0" o "1" según el valor
-                textposition='middle center',
-                textfont=dict(color='white', size=10, family='Arial Black'),
-                name='GCL Events',
-                showlegend=False,
-                hoverinfo='text',
-                hovertext=gcl_texts,
-            ),
-            row=3, col=1
-        )
+                row=3, col=1
+            )
+            # Marcadores con 0/1
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=[f"GCL {sw_name}"]*len(times),
+                    mode='markers+text',
+                    marker=dict(symbol='circle', size=15, color=colors,
+                                line=dict(width=2, color='black')),
+                    text=[str(s) for s in states],
+                    textposition='middle center',
+                    textfont=dict(color='white', size=10,
+                                  family='Arial Black'),
+                    name=f"GCL {sw_name}",
+                    showlegend=False,
+                    hoverinfo='text',
+                    hovertext=htexts,
+                ),
+                row=3, col=1
+            )
     else:
-        # Si no hay eventos GCL, mostrar un mensaje
         fig.add_annotation(
-            x=hyperperiod/2,
-            y=0,
+            x=hyperperiod/2, y=0,
             text="No hay eventos GCL para mostrar",
-            showarrow=False,
-            font=dict(size=12, color="gray"),
+            showarrow=False, font=dict(size=12, color="gray"),
             row=3, col=1
         )
-    
+        
     # Añadir línea vertical para el hiperperíodo
     fig.add_vline(
         x=hyperperiod,
@@ -599,20 +695,23 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     # Agregar leyenda interactiva para filtrar por tipo de evento
     fig.update_layout(
         legend=dict(
-            title="Tipo de evento",
-            orientation="h",
-            yanchor="bottom",
-            y=-0.2,
-            xanchor="center",
-            x=0.5,
+            orientation="v",     # vertical
+            yanchor="top",
+            y=1,
+            xanchor="left",
+            x=1.02,             # fuera del área de trazado
+            font=dict(size=11),
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1,
         )
     )
     
     # Vincular los ejes X para que el zoom se sincronice entre gráficas
     tick_interval = max(100, hyperperiod // 20)  # máx. 20 ticks
+    left_pad = max(global_max_gap * 1.1, 10)      # algo de margen
     fig.update_xaxes(
         title="Tiempo (µs)",
-        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        range=[-left_pad, hyperperiod*1.02],
         gridcolor='lightgray',
         griddash='dot',
         tickvals=list(range(0, hyperperiod + tick_interval, tick_interval)),
@@ -621,7 +720,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     
     fig.update_xaxes(
         title="Tiempo (µs)",
-        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        range=[-left_pad, hyperperiod*1.02],
         showgrid=True,
         gridcolor='lightgray',
         griddash='dot',
@@ -632,7 +731,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     
     fig.update_xaxes(
         title="Tiempo (µs)",
-        range=[-hyperperiod*0.02, hyperperiod*1.02],
+        range=[-left_pad, hyperperiod*1.02],
         showgrid=True,
         gridcolor='lightgray',
         griddash='dot',
@@ -657,10 +756,11 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     )
     
     # Manejo especial para el eje Y del GCL
+    gcl_rows = [f"GCL {sw}" for sw in sorted(gcl_by_switch.keys())] or ["GCL"]
     fig.update_yaxes(
-        showticklabels=True,                # Mostrar etiquetas
-        tickvals=['GCL'],                   # Establecer valores específicos
-        ticktext=['GCL'],                   # Establecer texto para esos valores
+        showticklabels=True,
+        tickvals=gcl_rows,
+        ticktext=gcl_rows,
         row=3, col=1,
         linecolor='black',
         gridcolor='rgba(200,200,200,0.3)'
@@ -706,12 +806,22 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
         )
     )
     
-    # ── leyendas limpiadas: sólo min-gap (decisión RL) ──
+    # ── Leyendas para bloques temporales ──────────────────────────────────
     fig.add_trace(
         go.Bar(
-            x=[None], y=[None], name="Espera ▸ min-gap",
-            marker=dict(color='rgba(220, 20, 60,0.8)',
-                        pattern=dict(shape="\\", solidity=0.35)),
+            x=[None], y=[None], name="Guard-band",
+            marker=dict(color='rgba(30,144,255,0.5)',
+                        pattern=dict(shape="/", solidity=0.35)),
+            showlegend=True)
+    )
+    # ya no es necesario añadir trazas «fantasma»;
+    # la barra Δ sw real se encarga de la entrada en la leyenda.
+    
+    # Añadimos marcador de «Transmisión» genérico (color neutro)
+    fig.add_trace(
+        go.Bar(
+            x=[None], y=[None], name="Transmisión",
+            marker=dict(color='rgba(160,160,160,0.7)'),
             showlegend=True)
     )
     

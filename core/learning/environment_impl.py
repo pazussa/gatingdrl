@@ -5,8 +5,10 @@ from core.network.net import Net
 from core.network.operation import Operation
 # import directo (la función sigue existiendo)
 from core.learning.env_actions import process_step_action
+import math, statistics as _stat
 # Add missing import for logging
 import logging
+
 
 def step(self, action):
     """
@@ -26,6 +28,12 @@ def step(self, action):
         Tuple: (observación, recompensa, terminado, truncado, info)
     """
     try:
+        # ──────────────────────────────────────────────────────────────
+        #  Inicializar métricas de latencia a 0 – se actualizarán al final
+        #  del episodio si todos los flujos se completan con éxito.
+        # ──────────────────────────────────────────────────────────────
+        avg_lat = jitter = max_lat = 0
+
         # NUEVO: Extraer la selección de flujo de la acción y aplicarla ANTES de procesar
         flow_selection = int(action[-1])  # La última dimensión es la selección de flujo
         
@@ -42,7 +50,13 @@ def step(self, action):
                         self.current_flow_idx = selected_idx
                         
                         # Añadir información de debug para seguimiento
-                        self.logger.info(f"Agente seleccionó flujo {self.flows[selected_idx].flow_id} (índice {selected_idx}) de candidatos: {[self.flows[idx].flow_id for idx in self.current_candidate_flows]}")
+                        # ↓  Pasa a DEBUG para no saturar la consola
+                        self.logger.debug(
+                            "Agente seleccionó flujo %s (idx %d) de candidatos: %s",
+                            self.flows[selected_idx].flow_id,
+                            selected_idx,
+                            [self.flows[idx].flow_id for idx in self.current_candidate_flows],
+                        )
                         
                         # Evaluar si la selección fue buena basándose en características
                         selected_flow = self.flows[selected_idx]
@@ -102,6 +116,13 @@ def step(self, action):
         # 1. Calcular tiempos                                          #
         # ------------------------------------------------------------ #
         if hop_idx == 0:        # ---------- primer hop ----------
+            # Registrar *exactamente* el instante en que se libera el primer bit
+            # del paquete en el cliente → op.start_time (no global_time).
+            if self.flow_first_tx[self.current_flow_idx] is None:
+                # El objeto `op` se crea unas líneas más abajo; de momento
+                # guardamos el valor provisional y lo sobrescribiremos enseguida.
+                self.flow_first_tx[self.current_flow_idx] = -1
+
             # Si no se entrega una red, construir topología y flujos sencillos
             if self.flow_first_tx[self.current_flow_idx] is None:
                 self.flow_first_tx[self.current_flow_idx] = self.global_time
@@ -153,6 +174,10 @@ def step(self, action):
             op.guard_factor      = guard_factor      # decisión RL
             op.min_gap_value     = switch_gap        # decisión RL
             op.guard_time        = guard_time        # longitud real del guard-band
+
+            # ⏱️  ahora sí: fijamos el instante real de partida
+            if self.flow_first_tx[self.current_flow_idx] == -1:
+                self.flow_first_tx[self.current_flow_idx] = op_start_time
 
         else:                   # ---------- hops siguientes ----------
             # ❷  Resto de hops:
@@ -298,8 +323,17 @@ def step(self, action):
         reward += flow_reward_adj
 
     except SchedulingError as e:
-        self.logger.info(f"Fallo: {e.msg} (flujo {self.current_flow_idx})")
-        return self._get_observation(), -1, True, False, {"success": False}
+        # Un flujo no cabe en su período ─ cerramos el episodio,
+        #  pero entregando TODO lo que sí se ha programado hasta ahora.
+        self.logger.debug(f"Fallo: {e.msg} (flujo {self.current_flow_idx})")
+
+        partial_res = {lnk: ops.copy()          # copia superficial es suficiente
+                       for lnk, ops in self.links_operations.items()}
+
+        return self._get_observation(), -1, True, False, {
+            "success": False,                  # episodio fallido
+            "ScheduleRes": partial_res,        # ← planificación parcial
+        }
 
     # ------------------------------------------------------------ #
     # 3. Avanzar progreso del flujo                                #
@@ -318,14 +352,12 @@ def step(self, action):
     self.global_queue_busy_until = op.reception_time
 
     if is_egress_from_switch:                 # ❷ liberar switch al terminar
-        # El switch se considera ocupado solo hasta que termina de transmitir el paquete
-        # Sin guard_time adicional para la ocupación del switch
-        self.switch_busy_until[sw_src] = op.end_time  # CORREGIDO: Eliminar guard_time
-        
-        # El guard_time solo afecta a cuándo puede empezar otra transmisión por el mismo puerto,
-        # pero el switch ya terminó su trabajo con este paquete en end_time
+        # Mantener el puerto bloqueado también durante la guard-band escogida
+        # para reflejar exactamente la reserva temporal del modelo matemático
+        self.switch_busy_until[sw_src] = op.end_time + guard_time
 
     self.flow_progress[self.current_flow_idx] += 1
+
 
     # ❸  El "reloj" global se redefine como el evento más temprano pendiente
     next_events = [*self.link_busy_until.values(),
@@ -340,8 +372,11 @@ def step(self, action):
         fst = self.flow_first_tx[self.current_flow_idx]
         e2e_latency = op.reception_time - fst if fst is not None else 0
         
-        # NUEVO: Guardar latencia e2e para análisis
-        self.last_operation_info['e2e_latency'] = e2e_latency
+        # NUEVO: Guardar latencia e2e para estadísticas globales
+        self._flow_latencies.append(e2e_latency)
+
+        # ➕ Registrar la muestra en el acumulador global
+        self._latency_samples.append(e2e_latency)
         
         # *Incluir* la propagación y el procesamiento de RX en el presupuesto
         # 💡 Tomar el peor‑caso acumulativo sobre la ruta completa
@@ -380,6 +415,21 @@ def step(self, action):
         self.consecutive_successes += 1
         # Añadir bonificación de recompensa proporcional al nivel de complejidad
         reward += 5.0 * self.current_complexity
+
+        # ──────────────────────────────────────────────────────────────
+        #  〽️  Calculamos las estadísticas de latencia del episodio
+        # ──────────────────────────────────────────────────────────────
+        if self._latency_samples:
+            avg_lat = sum(self._latency_samples) / len(self._latency_samples)
+            max_lat = max(self._latency_samples)
+            jitter  = _stat.pstdev(self._latency_samples) if len(self._latency_samples) > 1 else 0
+            self.logger.info(
+                f"⏱️  Latencia promedio={avg_lat:.1f} µs · "
+                f"jitter={jitter:.1f} µs · "
+                f"máxima={max_lat} µs"
+            )
+        else:
+            avg_lat = max_lat = jitter = 0
         
         # Mostrar información del progreso del curriculum
         if self.curriculum_enabled:
@@ -390,6 +440,14 @@ def step(self, action):
         "ScheduleRes": self.links_operations.copy() if done else None,
         "curriculum_level": self.current_complexity,
         "num_flows": len(self.flows),
+
+        # ─── métricas de latencia E2E ───
+        "latency_us": {
+            "average": avg_lat,
+            "jitter" : jitter,
+            "maximum": max_lat,
+            "samples": self._latency_samples.copy(),
+        },
         # NUEVO: Añadir información sobre selección de flujos
         "flow_selection": {
             "current_flow_idx": self.current_flow_idx,
@@ -398,5 +456,27 @@ def step(self, action):
             "reward_adj": flow_reward_adj
         }
     }
+
+    # ────────────────────────────────────────────────────────────────
+    #  Al terminar el episodio (todos los flujos entregados) → métricas
+    # ────────────────────────────────────────────────────────────────
+    if done and self._flow_latencies:
+        avg_lat = sum(self._flow_latencies) / len(self._flow_latencies)
+        max_lat = max(self._flow_latencies)
+        import statistics as _st
+        jitter = _st.pstdev(self._flow_latencies) if len(self._flow_latencies) > 1 else 0
+
+        # Log amigable
+        self.logger.info(
+            f"⏱️  Latencia promedio={avg_lat:.0f} µs · "
+            f"jitter={jitter:.0f} µs · máxima={max_lat:.0f} µs"
+        )
+
+        # Añadir al diccionario `info`
+        info["latency_us"] = {
+            "average": avg_lat,
+            "jitter":  jitter,
+            "max":     max_lat,
+        }
 
     return self._get_observation(), reward, done, False, info

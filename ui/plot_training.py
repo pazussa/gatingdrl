@@ -10,6 +10,7 @@ from tools.execute import execute_from_command_line
 from tools.definitions import OUT_DIR
 
 
+
 def plot_training_rewards(dirname: str):
     plot_results([dirname], None, 'timesteps', next((s for s in dirname.split(r'/') if '100' in s), None))
     filename = os.path.join(os.path.dirname(dirname), f"training_reward.png")
@@ -22,4 +23,5 @@ def plot_training_rewards(dirname: str):
 
 if __name__ == '__main__': 
     execute_from_command_line(plot_training_rewards)
+    
     

@@ -7,6 +7,7 @@ import sys
 EXCLUDED_FILES = {
   
 }
+
 EXCLUDED_DIRS = {
     '__pycache__', 
     '.git', 
@@ -16,6 +17,7 @@ EXCLUDED_DIRS = {
     'build', 
     'dist'
 }
+
 
 def collect_python_files(root_path):
     """Recopila todas las rutas de archivos Python en el proyecto"""

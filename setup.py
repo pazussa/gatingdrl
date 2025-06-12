@@ -1,6 +1,7 @@
 from setuptools import setup, find_packages
 from pathlib import Path
 
+
 setup(
     name="gatingdrl",
     version="0.1.0",

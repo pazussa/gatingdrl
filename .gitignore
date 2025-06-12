@@ -24,6 +24,7 @@ wheels/
 venv/
 env/
 ENV/
+.venv/
 
 # IDE
 .idea/
@@ -31,10 +32,8 @@ ENV/
 *.swp
 *.swo
 
-# Output files
-# Ignorar todos los archivos en out/ pero no la carpeta en sí
+# Output files - mantener estructura pero ignorar contenido
 /out/*
-# No ignorar este archivo para mantener la carpeta
 !/out/.gitkeep
 
 # Logs
@@ -48,3 +47,28 @@ ENV/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# PyTorch models
+*.pth
+*.pt
+
+# Temporary files
+*.tmp
+*.temp
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json

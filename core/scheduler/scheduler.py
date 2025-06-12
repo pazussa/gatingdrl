@@ -10,6 +10,7 @@ from sb3_contrib import MaskablePPO
 from core.learning.encoder import FeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+
 from tools.definitions import OUT_DIR
 from core.network.net import Flow, Link, Network, Net
 from core.network.operation import Operation
@@ -25,12 +26,20 @@ class DrlScheduler:
         """Inicializa el scheduler con una red y opcionalmente número de entornos"""
         self.network = network
         self.num_flows = len(network.flows)
-        self.num_envs = num_envs
         self.timeout_s = timeout_s
-        # Explicitly pass curriculum_enabled=False for testing
+        # ──────────────────────────────────────────────────────────────
+        #  INFERENCIA ⇒ un solo entorno
+        #     Con varios envs el método schedule() se detiene en cuanto
+        #     cualquiera termina (sea éxito o fallo), de modo que el
+        #     primer fallo aborta el episodio y el recuento queda a 0.
+        # ──────────────────────────────────────────────────────────────
+        self.num_envs = 1
         self.env = DummyVecEnv([
-            lambda: NetEnv(network, curriculum_enabled=use_curriculum, initial_complexity=1.0) 
-            for _ in range(num_envs)
+            lambda: NetEnv(
+                network,
+                curriculum_enabled=use_curriculum,
+                initial_complexity=1.0   # 100 % de los flujos en test
+            )
         ])
         # Mantener consistencia con el extractor usado al entrenar.
         policy_kwargs = dict(features_extractor_class=FeaturesExtractor)
@@ -58,44 +67,79 @@ class DrlScheduler:
             logging.error(f"Error cargando modelo: {e}")
             return False
         
-    def schedule(self) -> bool:
-        """Ejecuta el scheduling usando el modelo DRL"""
+    def schedule(self, max_episodes: int = 50, patience: int = 5) -> int:
+        """
+        Intenta como máximo ``max_episodes`` y se detiene si durante
+        ``patience`` episodios seguidos no mejora el mejor resultado.
+
+        Devuelve cuántos flujos se lograron programar en el mejor
+        episodio encontrado (0 → ninguno).  La solución parcial queda en
+        ``self.res`` y puede recuperarse con ``get_res()``.
+        """
+
         self.res = None
-        
-        # Intentar hasta 100 episodios como máximo
-        for _ in range(100):   # +100 % intentos ⇒ mayor tasa de éxito
+        best_res: ScheduleRes | None = None
+        best_count = 0
+        no_improve = 0
+
+        log = logging.getLogger(__name__)
+
+        for ep in range(1, max_episodes + 1):
             obs = self.env.reset()
             done = False
-            
-            # Procesar un episodio completo
-            while not done:
-                # Predecir acción con máscara
-                # `env_method` devuelve una lista de arrays (uno por entorno);
-                # apilamos para obtener shape (n_envs, n_actions).
-                action_masks = np.vstack(self.env.env_method('action_masks'))
-                # Asegurar dtype int8 para plena compatibilidad
-                action, _ = self.model.predict(
-                    obs, deterministic=True, action_masks=action_masks.astype(np.int8)
-                )
-                
-                # Ejecutar acción
-                obs, _, dones, infos = self.env.step(action)
 
-                # ⬇️  Propagar correctamente la terminación del episodio
+            while not done:
+                action_masks = np.vstack(self.env.env_method('action_masks'))
+                action, _ = self.model.predict(
+                    obs, deterministic=True,
+                    action_masks=action_masks.astype(np.int8)
+                )
+                obs, _, dones, infos = self.env.step(action)
                 done = any(dones)
 
-                if done:
-                    for i, is_done in enumerate(dones):
-                        if is_done and infos[i].get('success'):
-                            self.res = infos[i].get('ScheduleRes')
-                            return True      # éxito ⇒ abandonar bucle de episodios
-                    # Reiniciar si terminó sin éxito
-                    obs = self.env.reset()
-                    done = False
-            
-        # Si llegamos aquí, no se encontró solución
-        return False
-    
+                if not done:
+                    continue
+
+                # ---------- fin de episodio ----------
+                scheduled_cnt = 0
+                schedule_res = None
+                for i, is_done in enumerate(dones):
+                    if not is_done:
+                        continue
+                    schedule_res = infos[i].get('ScheduleRes')
+                    if schedule_res:
+                        scheduled_cnt = {
+                            f.flow_id
+                            for link_ops in schedule_res.values()
+                            for f, _ in link_ops
+                        }.__len__()
+                    break
+
+                if scheduled_cnt > best_count:
+                    best_count = scheduled_cnt
+                    best_res = schedule_res
+                    no_improve = 0
+                    log.info(f"[scheduler] episodio {ep}: "
+                             f"nueva mejor marca {best_count}/{self.num_flows}")
+                    if best_count == self.num_flows:          # ¡perfecto!
+                        self.res = best_res
+                        return best_count
+                else:
+                    no_improve += 1
+
+                if no_improve >= patience:
+                    log.warning(f"[scheduler] sin mejora en {patience} episodios; "
+                                f"mejor = {best_count}/{self.num_flows}.")
+                    self.res = best_res
+                    return best_count
+
+        # agotó max_episodes
+        logging.getLogger(__name__).warning(
+            f"[scheduler] alcanzado límite de {max_episodes} episodios; "
+            f"mejor = {best_count}/{self.num_flows}")
+        self.res = best_res
+        return best_count
+
     def get_res(self) -> ScheduleRes:
         """Retorna el resultado del scheduling"""
         return self.res
@@ -354,15 +398,17 @@ class ResAnalyzer:
                 flow.payload,
                 f"{num_hops} {status}"
             ))
-            
+
+        # ───────────────  RESUMEN GLOBAL  ───────────────
+        total_sched = len(scheduled_flows)
+        total_flows = len(self.network.flows)
+        print("-"*80)
+        print(f"Programados con éxito: {total_sched}/{total_flows} flujos")
         print("="*80 + "\n")
 
     # --- NUEVO: Método para imprimir las tablas GCL ---
     def print_gcl_tables(self):
-        """
-        Imprime las tablas GCL estáticas.
-        Muestra solo la tabla GCL generada sin referencia a umbrales.
-        """
+        """Print the generated GCL tables for visualization and debugging."""
         if not self._gcl_tables:
             print("\nNo se generaron tablas GCL (posiblemente no hubo gating o scheduling falló).")
             return
@@ -386,3 +432,234 @@ class ResAnalyzer:
                 print(f"{time:<12} | {state:<6}")
 
         print("="*80 + "\n")
+
+    def calculate_latency_metrics(self):
+        """
+        Calcula métricas de latencia extremo-a-extremo para todos los flujos programados.
+        
+        Returns:
+            dict: Diccionario con métricas de latencia (promedio, jitter, máxima, muestras)
+        """
+        import statistics as _stat
+        
+        print("🔍 INICIANDO CÁLCULO DE MÉTRICAS DE LATENCIA...")
+        print(f"📊 Tenemos {len(self.network.flows)} flujos totales")
+        print(f"📊 Tenemos {len(self.results)} enlaces con resultados")
+        
+        latencies = []
+        flows_processed = []
+        
+        # Para cada flujo programado, calcular su latencia E2E
+        for flow in self.network.flows:
+            flow_id = flow.flow_id
+            
+            # Buscar todas las operaciones de este flujo
+            flow_operations = []
+            
+            for link, operations in self.results.items():
+                for f, op in operations:
+                    if f.flow_id == flow_id:
+                        flow_operations.append((link, op))
+            
+            print(f"🔎 Flujo {flow_id}: encontradas {len(flow_operations)} operaciones")
+            
+            # Si el flujo tiene operaciones programadas
+            if flow_operations:
+                flows_processed.append(flow_id)
+                
+                if len(flow_operations) == 1:
+                    # Flujo de un solo hop
+                    _, op = flow_operations[0]
+                    latency = op.reception_time - op.start_time
+                    latencies.append(latency)
+                    print(f"  ✅ {flow_id} (1 hop): {op.start_time} → {op.reception_time} = {latency} µs")
+                
+                else:
+                    # Flujo multi-hop: ordenar por start_time para asegurar orden correcto
+                    sorted_ops = sorted(flow_operations, key=lambda x: x[1].start_time)
+                    first_op = sorted_ops[0][1]   # Primera operación
+                    last_op = sorted_ops[-1][1]   # Última operación
+                    
+                    latency = last_op.reception_time - first_op.start_time
+                    latencies.append(latency)
+                    print(f"  ✅ {flow_id} ({len(flow_operations)} hops): {first_op.start_time} → {last_op.reception_time} = {latency} µs")
+            else:
+                print(f"  ❌ {flow_id}: sin operaciones programadas")
+        
+        print(f"\n📈 RESUMEN: {len(flows_processed)} flujos procesados de {len(self.network.flows)} totales")
+        print(f"📊 Flujos con latencias calculadas: {flows_processed}")
+        
+        if not latencies:
+            print("⚠️  NO SE ENCONTRARON LATENCIAS PARA CALCULAR")
+            print("🔥 FORZANDO RETORNO DE MÉTRICAS VACÍAS")
+            return {
+                "average": 0,
+                "jitter": 0,
+                "maximum": 0,
+                "minimum": 0,
+                "samples": []
+            }
+        
+        # Calcular estadísticas
+        avg_lat = sum(latencies) / len(latencies)
+        max_lat = max(latencies)
+        min_lat = min(latencies)
+        jitter = _stat.pstdev(latencies) if len(latencies) > 1 else 0
+        
+        # FORZAR SALIDA MÚLTIPLE
+        print("\n" + "="*80)
+        print("🎯 MÉTRICAS DE LATENCIA EXTREMO-A-EXTREMO")
+        print("="*80)
+        print(f"📊 Promedio: {avg_lat:.1f} µs")
+        print(f"📊 Jitter:   {jitter:.1f} µs") 
+        print(f"📊 Máxima:   {max_lat} µs")
+        print(f"📊 Mínima:   {min_lat} µs")
+        print(f"📊 Muestras: {len(latencies)} flujos")
+        print(f"📊 Valores:  {latencies}")
+        print("="*80)
+        
+        # También usar logging
+        logging.info("🎯 MÉTRICAS DE LATENCIA EXTREMO-A-EXTREMO")
+        logging.info(f"📊 Promedio: {avg_lat:.1f} µs | Jitter: {jitter:.1f} µs | Máxima: {max_lat} µs | Mínima: {min_lat} µs | Muestras: {len(latencies)}")
+        
+        return {
+            "average": avg_lat,
+            "jitter": jitter,
+            "maximum": max_lat,
+            "minimum": min_lat,
+            "samples": latencies.copy()
+        }
+    
+    def calculate_link_utilization(self):
+        """
+        Calcula la utilización de cada enlace como porcentaje del tiempo ocupado
+        durante el hiperperíodo.
+        
+        
+        Returns:
+            dict: Diccionario con utilización por enlace y estadísticas globales
+        """
+        import math
+        
+        print("🔗 INICIANDO CÁLCULO DE UTILIZACIÓN DE ENLACES...")
+        
+        if not self.results:
+            print("⚠️  No hay resultados de scheduling para analizar")
+            return {"link_utilizations": {}, "global_stats": {}}
+        
+        link_utilizations = {}
+        all_utilizations = []
+        
+        # Calcular hiperperíodo global
+        all_periods = set()
+        for link, operations in self.results.items():
+            for flow, _ in operations:
+                all_periods.add(flow.period)
+        
+        hyperperiod = 1
+        for period in all_periods:
+            hyperperiod = math.lcm(hyperperiod, period)
+        
+        print(f"📊 Hiperperíodo global: {hyperperiod} µs")
+        
+        # Calcular utilización para cada enlace
+        for link, operations in self.results.items():
+            if not operations:
+                continue
+                
+            link_id = link.link_id if hasattr(link, 'link_id') else str(link)
+            print(f"\n🔍 Analizando enlace: {link_id}")
+            
+            # Tiempo total ocupado en el hiperperíodo
+            total_busy_time = 0
+            transmission_events = []
+            
+            # Para cada operación, calcular todas sus repeticiones en el hiperperíodo
+            for flow, operation in operations:
+                # Tiempo de transmisión por paquete
+                transmission_time = operation.end_time - (operation.gating_time or operation.start_time)
+                
+                # Número de repeticiones en el hiperperíodo
+                repetitions = hyperperiod // flow.period
+                
+                # Tiempo total de todas las repeticiones
+                flow_total_time = transmission_time * repetitions
+                total_busy_time += flow_total_time
+                
+                print(f"  ➤ Flujo {flow.flow_id}: {transmission_time}µs × {repetitions} repeticiones = {flow_total_time}µs")
+                
+                # Guardar eventos para verificación (opcional)
+                for rep in range(repetitions):
+                    offset = rep * flow.period
+                    start_tx = (operation.gating_time or operation.start_time) + offset
+                    end_tx = operation.end_time + offset
+                    transmission_events.append((start_tx, end_tx, flow.flow_id))
+            
+            # Calcular utilización como porcentaje
+            utilization_percent = (total_busy_time / hyperperiod) * 100
+            
+            link_utilizations[str(link_id)] = {
+                "utilization_percent": utilization_percent,
+                "busy_time_us": total_busy_time,
+                "hyperperiod_us": hyperperiod,
+                "num_flows": len(operations),
+                "transmission_events": len(transmission_events)
+            }
+            
+            all_utilizations.append(utilization_percent)
+            
+            print(f"  📈 Utilización: {utilization_percent:.2f}% ({total_busy_time}/{hyperperiod} µs)")
+        
+        # Estadísticas globales
+        if all_utilizations:
+            global_stats = {
+                "average_utilization": sum(all_utilizations) / len(all_utilizations),
+                "max_utilization": max(all_utilizations),
+                "min_utilization": min(all_utilizations),
+                "total_links": len(all_utilizations),
+                "hyperperiod_us": hyperperiod
+            }
+        else:
+            global_stats = {
+                "average_utilization": 0,
+                "max_utilization": 0,
+                "min_utilization": 0,
+                "total_links": 0,
+                "hyperperiod_us": hyperperiod
+            }
+        
+        # Mostrar resumen
+        print("\n" + "="*80)
+        print("🔗 UTILIZACIÓN DE ENLACES")
+        print("="*80)
+        
+        # Tabla detallada por enlace
+        print(f"{'Enlace':<25} | {'Utilización':<12} | {'Tiempo Ocupado':<15} | {'Flujos':<6}")
+        print("-"*25 + " | " + "-"*12 + " | " + "-"*15 + " | " + "-"*6)
+        
+        for link_str, stats in link_utilizations.items():
+            print(f"{link_str:<25} | {stats['utilization_percent']:>10.2f}% | "
+                  f"{stats['busy_time_us']:>13} µs | {stats['num_flows']:>4}")
+        
+        print("-"*80)
+        print(f"📊 ESTADÍSTICAS GLOBALES:")
+        print(f"   • Utilización promedio: {global_stats['average_utilization']:.2f}%")
+        print(f"   • Utilización máxima:   {global_stats['max_utilization']:.2f}%")
+        print(f"   • Utilización mínima:   {global_stats['min_utilization']:.2f}%")
+        print(f"   • Enlaces analizados:   {global_stats['total_links']}")
+        print(f"   • Hiperperíodo:         {global_stats['hyperperiod_us']} µs")
+        print("="*80 + "\n")
+        
+        # Log también las métricas
+        logging.info(
+            f"🔗 Utilización de Enlaces → "
+            f"Promedio: {global_stats['average_utilization']:.2f}% | "
+            f"Máxima: {global_stats['max_utilization']:.2f}% | "
+            f"Mínima: {global_stats['min_utilization']:.2f}% | "
+            f"Enlaces: {global_stats['total_links']}"
+        )
+        
+        return {
+            "link_utilizations": link_utilizations,
+            "global_stats": global_stats
+        }

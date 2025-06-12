@@ -1,5 +1,6 @@
 import logging
 
+
 # 1. ✅ Configura el logger de matplotlib.font_manager ANTES de importar matplotlib
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
@@ -16,6 +17,7 @@ try:
 except KeyError:
     # Ignorar si este parámetro tampoco es válido
     pass
+
 
 # 3. Función para configurar el logging general
 def log_config(filename, level=logging.DEBUG):

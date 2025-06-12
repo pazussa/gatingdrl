@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Optional, List, Dict, Any
 
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -151,6 +152,16 @@ class NetEnv(gym.Env):
         # Orden FIFO inmutable: simplemente el índice de creación del flujo
         # (flows ya está en el mismo orden en que se generaron).
         self._fifo_order = list(range(self.num_flows))
+
+        # ──────────────────────────────────────────────────────────────
+        #  📊  Métricas de latencia extremo-a-extremo (µs) por episodio
+        # ──────────────────────────────────────────────────────────────
+        #   Se irán llenando a medida que cada flujo se completa.
+        #   Se resumen al final del episodio en environment_impl.step.
+        self._latency_samples: list[int] = []
+
+        # ⏱️  lista para almacenar la latencia de cada flujo completado
+        self._flow_latencies: list[int] = []
 
     # ----------------------------------------------------------------- #
     #  Helper estático (picklable) para muestrear la separación global  #
@@ -363,7 +374,13 @@ class NetEnv(gym.Env):
         self.switch_last_arrival.clear()    # NUEVO: Limpiar tiempos de llegada
         self.global_queue_busy_until = 0
         self.last_packet_start = -Net.PACKET_GAP_EXTRA
-                                           
+
+        # Limpiar métricas de latencia para el nuevo episodio
+        self._latency_samples.clear()
+
+        # ⏱️  reiniciar latencias e2e acumuladas
+        self._flow_latencies.clear()
+
         return self._get_observation(), {}
 
     # --------------------------------------------------------------------- #
@@ -554,3 +571,4 @@ class NetEnv(gym.Env):
 
     def close(self):
         pass
+

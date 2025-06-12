@@ -10,6 +10,8 @@ from tools.definitions import OUT_DIR
 
 
 
+
+
 def display_schedule_log(log_file=None, by_link=True):
     """
     Display the contents of a scheduling log file.

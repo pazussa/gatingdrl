@@ -13,3 +13,5 @@ if PROJECT_ROOT not in sys.path:
 
 # Diagnóstico: mostrar el path de Python completo
 
+
+

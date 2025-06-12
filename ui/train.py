@@ -7,6 +7,9 @@ import random
 import os
 import sys
 import shutil  # Para eliminar directorios recursivamente
+import time
+from stable_baselines3.common.callbacks import BaseCallback
+
 
 # Add Qt platform environment variable before any imports that might use Qt
 # This helps Qt find the correct platform plugin
@@ -64,8 +67,8 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
         graph = generate_graph(topo, link_rate)
 
         # Simplificar - eliminar jitters
-        # Use UniDirectionalFlowGenerator for UNIDIR topology
-        is_unidir = topo == "UNIDIR"
+        # Cualquier variante "UNIDIR*" se trata como unidireccional
+        is_unidir = topo.startswith("UNIDIR")
         # Pasar el rango de payload al generador
         if is_unidir:
             flow_generator = UniDirectionalFlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
@@ -93,7 +96,7 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
     return _init
 
 
-def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True):
+def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True, show_log: bool = True):
     # ────────────────────────────────────────────────────────────────
     #  NUEVO: Limpiar completamente el directorio de salida
     # ────────────────────────────────────────────────────────────────
@@ -128,7 +131,7 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
 
     eval_env = SubprocVecEnv([
         # El entorno de evaluación también usa la misma configuración
-        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False)  # Siempre desactivar curriculum en evaluación
+        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False)
         for i in range(n_envs)
         ])
     
@@ -140,13 +143,271 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
                    eval_freq=max(10000 // n_envs, 1))
     ]
 
-    # Train the agent with just the eval callback
-    model.learn(total_timesteps=num_time_steps, callback=callbacks)
+    # ══════════════════════════════════════════════════════════════════
+    #  📊 NUEVO: Variables para medir tiempo de convergencia
+    # ══════════════════════════════════════════════════════════════════
+    convergence_data = {
+        "rewards": [],           # Historial de rewards promedio
+        "episode_numbers": [],   # Números de episodio
+        "timestamps": [],        # Timestamps reales
+        "convergence_episode": None,    # Episodio donde converge
+        "convergence_time": None,       # Tiempo real de convergencia
+        "is_converged": False,          # Si ya convergió
+        "stability_window": 100,        # Ventana para medir estabilidad
+        "stability_threshold": 0.05,    # Umbral de variación para convergencia (5%)
+        "min_episodes_for_convergence": 200  # Mínimo de episodios antes de declarar convergencia
+    }
+    
+    
+    start_time = time.time()
+    
+    # Callback para capturar métricas de convergencia
+    class ConvergenceCallback(BaseCallback):
+        def __init__(self, convergence_data, max_timesteps, verbose=0):
+            super().__init__(verbose)
+            self.convergence_data = convergence_data
+            self.episode_count = 0
+            self.max_timesteps = max_timesteps
+            self.timesteps_count = 0
+            self.logged_stop = False
+            
+        def _on_step(self) -> bool:
+            # CONTROL ESTRICTO: Usar el contador interno del modelo
+            current_timesteps = self.model.num_timesteps
+            
+            # FORZAR PARADA EXACTA cuando alcance el límite
+            if current_timesteps >= self.max_timesteps:
+                if not self.logged_stop:
+                    logging.info(f"🛑 PARADA FORZADA: Alcanzado límite exacto de {self.max_timesteps} timesteps")
+                    logging.info(f"🔢 Timesteps del modelo: {current_timesteps}")
+                    self.logged_stop = True
+                return False  # Detener inmediatamente
+            
+            # Capturar datos cada vez que termina un episodio
+            if len(self.locals.get('dones', [])) > 0 and any(self.locals['dones']):
+                self.episode_count += 1
+                
+                # Obtener reward promedio de los entornos activos
+                if 'infos' in self.locals:
+                    episode_rewards = []
+                    for info in self.locals['infos']:
+                        if isinstance(info, dict) and 'episode' in info:
+                            episode_rewards.append(info['episode']['r'])
+                    
+                    if episode_rewards:
+                        avg_reward = sum(episode_rewards) / len(episode_rewards)
+                        current_time = time.time()
+                        
+                        # Guardar datos
+                        self.convergence_data["rewards"].append(avg_reward)
+                        self.convergence_data["episode_numbers"].append(self.episode_count)
+                        self.convergence_data["timestamps"].append(current_time)
+                        
+                        # Verificar convergencia si tenemos suficientes datos
+                        self._check_convergence()
+                        
+                        # Log de progreso cada 100 episodios
+                        if self.episode_count % 100 == 0:
+                            logging.info(f"📊 Episodio {self.episode_count}, Timesteps: {current_timesteps}/{self.max_timesteps}, Reward promedio: {avg_reward:.3f}")
+                        
+            return True
+            
+        def _check_convergence(self):
+            """Verifica si el algoritmo ha convergido basándose en la estabilidad de rewards"""
+            data = self.convergence_data
+            
+            # No verificar hasta tener suficientes episodios
+            if (len(data["rewards"]) < data["min_episodes_for_convergence"] or 
+                data["is_converged"]):
+                return
+                
+            window_size = data["stability_window"]
+            threshold = data["stability_threshold"]
+            
+            # Verificar si tenemos suficientes datos para la ventana
+            if len(data["rewards"]) < window_size:
+                return
+                
+            # Obtener los últimos rewards en la ventana
+            recent_rewards = data["rewards"][-window_size:]
+            
+            # Calcular estadísticas de estabilidad
+            mean_reward = sum(recent_rewards) / len(recent_rewards)
+            
+            if mean_reward == 0:  # Evitar división por cero
+                return
+                
+            # Calcular coeficiente de variación (desviación estándar / media)
+            variance = sum((r - mean_reward) ** 2 for r in recent_rewards) / len(recent_rewards)
+            std_dev = variance ** 0.5
+            coefficient_of_variation = std_dev / abs(mean_reward)
+            
+            # Declarar convergencia si la variación es menor al umbral
+            if coefficient_of_variation <= threshold:
+                data["is_converged"] = True
+                data["convergence_episode"] = data["episode_numbers"][-1]
+                data["convergence_time"] = data["timestamps"][-1] - data["timestamps"][0]
+                
+                logging.info(
+                    f"🎯 CONVERGENCIA DETECTADA en episodio {data['convergence_episode']} "
+                    f"(Coef. Variación: {coefficient_of_variation:.4f} ≤ {threshold})"
+                )
+    
+    # Crear callback de convergencia con límite de timesteps
+    convergence_callback = ConvergenceCallback(convergence_data, num_time_steps)
+    
+    # Combinar callbacks existentes con el de convergencia
+    callbacks = [
+        EvalCallback(eval_env, 
+                   best_model_save_path=get_best_model_path(topo=topo, alg=DRL_ALG),
+                   log_path=OUT_DIR, 
+                   eval_freq=max(10000 // n_envs, 1)),
+        convergence_callback
+    ]
 
+    # ══════════════════════════════════════════════════════════════════
+    #  🎯 ENTRENAMIENTO CON CONTROL EXACTO DE TIMESTEPS - VERSIÓN CORREGIDA
+    # ══════════════════════════════════════════════════════════════════
+    logging.info(f"Iniciando entrenamiento por EXACTAMENTE {num_time_steps} timesteps...")
+    logging.info(f"Usando {n_envs} entornos en paralelo")
+    
+    # Crear un callback adicional más simple que solo controle timesteps
+    class StrictTimestepCallback(BaseCallback):
+        def __init__(self, max_timesteps, verbose=0):
+            super().__init__(verbose)
+            self.max_timesteps = max_timesteps
+            self.logged = False
+            
+        def _on_step(self) -> bool:
+            if self.model.num_timesteps >= self.max_timesteps:
+                if not self.logged:
+                    logging.info(f"🚨 PARADA ESTRICTA: {self.model.num_timesteps} timesteps alcanzados")
+                    self.logged = True
+                return False
+            return True
+    
+    # Combinar callbacks con el de parada estricta como el último
+    callbacks = [
+        EvalCallback(eval_env, 
+                   best_model_save_path=get_best_model_path(topo=topo, alg=DRL_ALG),
+                   log_path=OUT_DIR, 
+                   eval_freq=max(10000 // n_envs, 1)),
+        convergence_callback,
+        StrictTimestepCallback(num_time_steps)  # Este tiene la prioridad final
+    ]
+
+    # Entrenar con configuración más estricta
+    model.learn(
+        total_timesteps=num_time_steps,
+        callback=callbacks,
+        progress_bar=True,
+        reset_num_timesteps=True
+    )
+    
+    # Verificar timesteps finales con mayor detalle
+    actual_timesteps = model.num_timesteps
+    
+    logging.info(f"✅ Entrenamiento completado")
+    logging.info(f"🎯 Timesteps solicitados: {num_time_steps}")
+    logging.info(f"📊 Timesteps ejecutados: {actual_timesteps}")
+    
+    if actual_timesteps == num_time_steps:
+        logging.info(f"🎯 PERFECTO: Timesteps exactos ejecutados")
+    elif actual_timesteps > num_time_steps:
+        sobrepaso = actual_timesteps - num_time_steps
+        sobrepaso_pct = (sobrepaso / num_time_steps) * 100
+        logging.warning(f"⚠️ SOBREPASO: {sobrepaso} timesteps adicionales ({sobrepaso_pct:.2f}%)")
+    else:
+        deficit = num_time_steps - actual_timesteps
+        logging.warning(f"⚠️ DÉFICIT: {deficit} timesteps menos de lo esperado")
+    
+    end_time = time.time()
+    total_training_time = end_time - start_time
+    
     logging.info("Training complete.")
 
+    # ══════════════════════════════════════════════════════════════════
+    #  📊 ANÁLISIS Y REPORTE DE CONVERGENCIA
+    # ══════════════════════════════════════════════════════════════════
+    if show_log:
+        print("\n" + "="*80)
+        print("🎯 ANÁLISIS DE CONVERGENCIA DEL ENTRENAMIENTO")
+        print("="*80)
+        
+        total_episodes = len(convergence_data["rewards"])
+        
+        if convergence_data["is_converged"]:
+            convergence_episode = convergence_data["convergence_episode"]
+            convergence_time_seconds = convergence_data["convergence_time"]
+            convergence_percentage = (convergence_episode / total_episodes) * 100
+            
+            print(f"✅ CONVERGENCIA ALCANZADA:")
+            print(f"   📈 Episodio de convergencia: {convergence_episode}/{total_episodes} ({convergence_percentage:.1f}%)")
+            print(f"   ⏱️  Tiempo hasta convergencia: {convergence_time_seconds:.1f} segundos")
+            print(f"   📊 Ventana de estabilidad: {convergence_data['stability_window']} episodios")
+            print(f"   🎚️  Umbral de variación: {convergence_data['stability_threshold']*100:.1f}%")
+            
+            # Calcular eficiencia del entrenamiento
+            efficiency = (total_training_time - convergence_time_seconds) / total_training_time * 100
+            if efficiency > 0:
+                print(f"   ⚡ Tiempo 'desperdiciado' post-convergencia: {efficiency:.1f}% del entrenamiento")
+        
+        else:
+            print(f"⚠️  NO SE DETECTÓ CONVERGENCIA:")
+            print(f"   📈 Episodios totales: {total_episodes}")
+            print(f"   ⏱️  Tiempo total: {total_training_time:.1f} segundos")
+            print(f"   📊 Ventana requerida: {convergence_data['stability_window']} episodios estables")
+            print(f"   🎚️  Umbral requerido: variación ≤ {convergence_data['stability_threshold']*100:.1f}%")
+            
+            # Analizar la tendencia final
+            if len(convergence_data["rewards"]) >= 50:
+                recent_50 = convergence_data["rewards"][-50:]
+                mean_recent = sum(recent_50) / len(recent_50)
+                variance_recent = sum((r - mean_recent) ** 2 for r in recent_50) / len(recent_50)
+                std_recent = variance_recent ** 0.5
+                cv_recent = std_recent / abs(mean_recent) if mean_recent != 0 else float('inf')
+                
+                print(f"   📉 Variación en últimos 50 episodios: {cv_recent*100:.2f}%")
+                
+                if cv_recent <= convergence_data['stability_threshold'] * 2:  # Doble del umbral
+                    print(f"   💡 Sugerencia: El algoritmo está cerca de converger, considere más episodios")
+        
+        # Estadísticas generales del entrenamiento
+        if convergence_data["rewards"]:
+            max_reward = max(convergence_data["rewards"])
+            min_reward = min(convergence_data["rewards"])
+            final_reward = convergence_data["rewards"][-1]
+            avg_reward = sum(convergence_data["rewards"]) / len(convergence_data["rewards"])
+            
+            print(f"\n📊 ESTADÍSTICAS DE RECOMPENSAS:")
+            print(f"   🏆 Máxima: {max_reward:.3f}")
+            print(f"   📉 Mínima: {min_reward:.3f}")
+            print(f"   🎯 Final: {final_reward:.3f}")
+            print(f"   📈 Promedio: {avg_reward:.3f}")
+        
+        print("="*80)
+    else:
+        # Siempre mostrar un resumen básico aunque show_log sea False
+        total_episodes = len(convergence_data["rewards"])
+        if convergence_data["is_converged"]:
+            print(f"✅ Convergencia alcanzada en episodio {convergence_data['convergence_episode']}/{total_episodes}")
+        else:
+            print(f"⚠️ Sin convergencia detectada en {total_episodes} episodios")
+    
+    # Log para archivo (siempre se escribe en el log)
+    if convergence_data["is_converged"]:
+        logging.info(
+            f"🎯 Convergencia: episodio {convergence_data['convergence_episode']} "
+            f"({convergence_data['convergence_time']:.1f}s) de {total_episodes} episodios totales"
+        )
+    else:
+        logging.info(f"⚠️ Sin convergencia detectada en {total_episodes} episodios ({total_training_time:.1f}s)")
+
     # NUEVO: Ejecutar un episodio final y guardar los detalles del scheduling
-    logging.info("Ejecutando episodio final para generar informe detallado...")
+    if show_log:
+        logging.info("Ejecutando episodio final para generar informe detallado...")
+        print("\n🔍 Ejecutando episodio final para validar el entrenamiento...")
+    
     obs = env.reset()
     done = False
     final_info = None
@@ -164,11 +425,15 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
                     final_info = infos[i]
                     break
     
-    # Remove report generation code
+    # Mostrar resultado del episodio final si show_log está activado
     if final_info and final_info.get('ScheduleRes'):
+        if show_log:
+            print(f"✅ Episodio de validación exitoso: {len(final_info['ScheduleRes'])} enlaces programados")
+            print(f"📊 Flujos programados: {final_info.get('scheduled_flows', 0)}/{final_info.get('total_flows', num_flows)}")
         logging.info(f"Scheduling final exitoso con {len(final_info['ScheduleRes'])} enlaces programados")
+    elif show_log:
+        print("⚠️ Episodio de validación no completó el scheduling exitosamente")
 
-    logging.info("------Finish learning------")
     return None  # Return None instead of metrics
 
 
@@ -224,7 +489,6 @@ def main():
     parser = argparse.ArgumentParser(conflict_handler="resolve")
     parser.add_argument('--time_steps', type=int, required=True)
     parser.add_argument('--num_flows', type=int, nargs='?', default=NUM_FLOWS)
-    parser.add_argument('--debug', action='store_true')
     # Eliminar la opción de especificar num_envs, ahora es automático
     parser.add_argument('--topo', type=str, default="SIMPLE", help="Topology type (e.g., SIMPLE, UNIDIR)")
     parser.add_argument('--link_rate', type=int, default=100)
@@ -234,28 +498,22 @@ def main():
     # Cambio: Hacer --model opcional con un valor por defecto de None
     parser.add_argument('--model', type=str, default=None, 
                        help="Ruta opcional a un modelo pre-entrenado. Por defecto no carga ninguno.")
-    # ------------- argumentos para la separación probabilística -------------
-    parser.add_argument('--gap-mode', type=str, default='fixed',
-                        choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
-                        help="Modo de cálculo del gap en µs entre creaciones de paquetes")
-    parser.add_argument('--pkt-gap', type=int, default=0,
-                        help="• fixed ⇒ valor constante\n"
-                             "• exponential ⇒ media μ (λ = 1/μ)")
-    parser.add_argument('--gap-uniform', type=int, nargs=2, metavar=('MIN', 'MAX'),
-                        help="Sólo con --gap-mode uniform: intervalo [MIN,MAX]")
-    parser.add_argument('--gap-gauss', type=int, nargs=2, metavar=('MEAN','STD'),
-                        help="Sólo con --gap-mode gaussian: media μ y desvío σ (µs)")
-    parser.add_argument('--gap-pareto', type=float, nargs=2, metavar=('ALPHA','XM'),
-                        help="Sólo con --gap-mode pareto: shape α y scale xm")
-    # ------------- interfaz unificada de distribución de gaps ---------------
+    # ------------- distribución del gap ------------- 
+    # Ahora **todo** se controla con --dist y --dist-params
     parser.add_argument('--dist', type=str, default='fixed',
                         choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
                         help="Tipo de distribución de separación de paquetes")
     parser.add_argument('--dist-params', type=float, nargs='+', default=[],
                         help="Parámetros numéricos de la distribución (ver doc)")
-    parser.add_argument('--arrival-dist', type=str, default='set',
-                        choices=['set', 'uniform', 'exponential'],
-                        help="Distribución para el período de cada flujo")
+
+    # --- NUEVAS OPCIONES PARA COINCIDIR CON ui/test.py --------------------
+    parser.add_argument('--visualize', action='store_true', default=True,
+                        help='Generar visualización TSN al terminar')
+    parser.add_argument('--show-log', action='store_true', default=True,
+                        help='Mostrar información detallada del entrenamiento y scheduling')
+    parser.add_argument('--gcl-threshold', type=int, default=30,
+                        help='Umbral (µs) para generar entradas GCL')
+                        
     # Añadir opción para controlar el curriculum learning
     parser.add_argument('--curriculum', action='store_true', default=True,
                       help='Usar curriculum learning adaptativo (por defecto activado)')
@@ -284,34 +542,11 @@ def main():
 
     # 👉 Aplicar el valor elegido antes de crear cualquier entorno
     from core.network.net import Net
-    if args.pkt_gap < 0:
-        logging.error("Error: pkt-gap debe ser >= 0")
-        sys.exit(1)
-    # -------- aplicar configuración global del gap -------- #
-    Net.PACKET_GAP_MODE = args.gap_mode
-    if args.gap_mode == 'uniform':
-        if args.gap_uniform is None or len(args.gap_uniform) != 2:
-            logging.error("Debe proporcionar --gap-uniform MIN MAX con --gap-mode uniform")
-            sys.exit(1)
-        Net.PACKET_GAP_UNIFORM = tuple(args.gap_uniform)
-    Net.PACKET_GAP_EXTRA = max(args.pkt_gap, 0)
-
-    if args.gap_mode == 'gaussian':
-        if args.gap_gauss is None or len(args.gap_gauss) != 2:
-            logging.error("Debe proporcionar --gap-gauss MEAN STD con --gap-mode gaussian")
-            sys.exit(1)
-        Net.PACKET_GAP_GAUSS = tuple(args.gap_gauss)
-
-    if args.gap_mode == 'pareto':
-        if args.gap_pareto is None or len(args.gap_pareto) != 2:
-            logging.error("Debe proporcionar --gap-pareto ALPHA XM con --gap-mode pareto")
-            sys.exit(1)
-        Net.PACKET_GAP_PARETO = tuple(args.gap_pareto)
-
-    # -------- aplicar configuración global del gap -------- #
+    
+    # -------- configuración única (vigente) -------- #
     try:
         Net.set_gap_distribution(args.dist, args.dist_params)
-    except AssertionError as e:
+    except (AssertionError, ValueError) as e:
         logging.error(e)
         sys.exit(1)
 
@@ -333,7 +568,7 @@ def main():
     assert MONITOR_DIR is not None
 
     logging.info("start training...")
-    # metrics variable is ignored since it's now None
+    # Pasar show_log al método train
     train(args.topo, args.time_steps,
           MONITOR_DIR,  # Pasar MONITOR_DIR como parámetro
           num_flows=args.num_flows,
@@ -341,7 +576,8 @@ def main():
           link_rate=args.link_rate,
           min_payload=args.min_payload, # Pasar min/max payload
           max_payload=args.max_payload,
-          use_curriculum=args.curriculum)
+          use_curriculum=args.curriculum,
+          show_log=args.show_log)  # ← NUEVO: Pasar show_log
 
     # Add try-except block around plotting
     try:
@@ -353,9 +589,19 @@ def main():
     # Remove metrics summary code
     logging.info(f"Training completed successfully.")
 
-    # Ya no necesitamos pasar la ruta del modelo, test la determinará automáticamente
-    test(args.topo, args.num_flows, NUM_ENVS, alg=DRL_ALG, link_rate=args.link_rate, min_payload=args.min_payload, max_payload=args.max_payload)
-
+    # Al terminar training, invocamos test con los mismos args
+    test(
+        args.topo,
+        args.num_flows,
+        NUM_ENVS,
+        alg=DRL_ALG,
+        link_rate=args.link_rate,
+        min_payload=args.min_payload,
+        max_payload=args.max_payload,
+        visualize=args.visualize,
+        show_log=args.show_log,  # ← NUEVO: Pasar show_log también a test
+        gcl_threshold=args.gcl_threshold
+    )
 
 if __name__ == "__main__":
     main()

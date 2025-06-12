@@ -17,7 +17,9 @@ only relies on public attributes of `core.network` objects, on the final
 `ScheduleRes`, and on the «GCL tables» returned by `ResAnalyzer`.
 """
 
+
 from __future__ import annotations
+import logging
 
 import os
 import math
@@ -275,29 +277,13 @@ def _ini_gcl(
         recon_norm = sorted(recon_table, key=lambda x: x[0])
         orig_norm  = orig_table
 
+        # Si las tablas no coinciden, registra un mensaje breve solo en nivel DEBUG.
+        # Así evitamos saturar la salida estándar durante `ui/test.py`.
         if recon_norm != orig_norm:
-            import textwrap, logging
-            logging.warning(
-                "\n".join([
-                    "",
-                    "────────────────────────────────────────────────────────",
-                    f"GCL CHECK  ⟹  DIFERENCIA EN PUERTO {src}.eth[{port}]",
-                    "────────────────────────────────────────────────────────",
-                    "ORIGINAL:          RECONSTRUIDA DESDE durations:",
-                    *[
-                        f"{o[0]:>6} µs | {o[1]}        ||      "
-                        f"{r[0]:>6} µs | {r[1]}"
-                        for o, r in zip(
-                            orig_norm + [('', '')]*(len(recon_norm)-len(orig_norm)),
-                            recon_norm + [('', '')]*(len(orig_norm)-len(recon_norm))
-                        )
-                    ],
-                    "────────────────────────────────────────────────────────",
-                    "Revisa la lógica que genera «durations»: puede que se",
-                    "esté filtrando/eliminando algún evento o que el orden",
-                    "de los mismos no sea exactamente el original.",
-                    ""
-                ])
+            import logging
+            logging.getLogger(__name__).debug(
+                f"[GCL-CHECK] Diferencia detectada en {src}.eth[{port}] "
+                "(detalles omitidos; habilita DEBUG para ver el diff)."
             )
 
     return txt
@@ -417,6 +403,8 @@ def write_ini(
         minimal_ini = "[General]\nnetwork = inet.showcases.tsn.generated.GeneratedTsnNetwork\n"
         Path(outfile).write_text(minimal_ini, encoding="utf-8")
 
+
+
 def export_omnet_files(network: Network, schedule_res: ScheduleRes, gcl_tables: Dict[Link, List[Tuple[int, int]]], label: str, out_dir: os.PathLike, gate_port:int=2) -> Tuple[Path, Path]:
     """Create *.ned & *.ini in *out_dir* (overwriting any previous version)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -435,4 +423,19 @@ def export_omnet_files(network: Network, schedule_res: ScheduleRes, gcl_tables: 
     write_ini(network, schedule_res, gcl_tables, ini_path, net_name, gate_port)
 
     print(f"[omnet_export]  generated → {ned_path}, {ini_path}")
+
+    # ──────────────────────────────────────────────────────────────
+    #  Resumen global de planificación (ahora SÍ con variables)
+    # ──────────────────────────────────────────────────────────────
+    total_flows = len(network.flows)
+    scheduled_ids = {
+        f.flow_id
+        for ops in schedule_res.values()
+        for f, _ in ops
+    }                                        # ← únicos
+    ok_flows = len(scheduled_ids)
+
+    msg = f"Programados con éxito: {ok_flows}/{total_flows} flujos"
+    print(msg)           # ← visible siempre
+    logging.info(msg)    # ← para quien tenga el logger a nivel INFO
     return ned_path, ini_path

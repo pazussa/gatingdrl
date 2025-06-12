@@ -2,6 +2,7 @@ import argparse
 import inspect
 from typing import Any, Callable, List, Type, get_origin, get_args
 
+
 def custom_list_type(item_type: Type) -> Callable[[str], List[Any]]:
     """
     Generates a function to convert a comma-separated string into a list of a specific type.
@@ -19,6 +20,7 @@ def custom_list_type(item_type: Type) -> Callable[[str], List[Any]]:
     def convert(s: str) -> List[Any]:
         return [item_type(item) for item in s.split(',')]
     return convert
+
 
 
 

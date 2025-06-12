@@ -6,6 +6,8 @@ import numpy as np
 
 from core.network.net import Net  # Añadido para acceder a Net.DELAY_PROC_RX
 
+
+
 @dataclass
 class Operation:
     start_time: int
@@ -121,7 +123,15 @@ def check_operation_isolation(operation1: tuple[Operation, int],
         for _ in range(beta):
             if (operation_lhs.start_time <= operation_rhs.start_time < operation_lhs.end_time) or \
                     (operation_rhs.start_time <= operation_lhs.start_time < operation_rhs.end_time):
-                return operation_rhs.end_time - operation_lhs.start_time
+                # Desplazamiento bruto necesario para eliminar la colisión
+                raw_offset = operation_rhs.end_time - operation_lhs.start_time
+
+                # Reducirlo al mínimo compatible con ambos períodos
+                gcd_period = math.gcd(period1, period2)
+                offset = raw_offset % gcd_period
+
+                # Si el módulo es 0 (raw_offset múltiplo del mcd) desplazamos un ciclo completo
+                return offset if offset != 0 else gcd_period
             operation_rhs.add(period2)
 
         operation_lhs.add(period1)
