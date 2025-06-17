@@ -28,7 +28,7 @@ pip install -e .
 ```bash
 python ui/test.py --topo UNIDIR --num_flows 30 \
                   --alg MaskablePPO --link_rate 1000 \
-                  --min-payload 1000 --max-payload 1500
+                  --min-payload 1000 --max-payload 1500 --seed 42
 ```
 
 El script genera:
@@ -39,8 +39,45 @@ El script genera:
 ## Entrenamiento (opcional)
 
 ```bash
-python ui/train.py --time_steps 50000 --topo UNIDIR --num_flows 49 --link_rate 1000 --min-payload 800 --max-payload 1500
+python ui/train.py --time_steps 50000 --topo UNIDIR --num_flows 49 --link_rate 1000 --min-payload 800 --max-payload 1500 --seed 42
 ```
+
+# GatingDRL: TSN Scheduling with Deep Reinforcement Learning
+
+## Overview
+
+This project implements Time Sensitive Networks (TSN) scheduling using Deep Reinforcement Learning, specifically MaskablePPO from Stable Baselines3. The system optimizes gate control schedules for time-aware traffic shaping in industrial networks.
+
+## Features
+
+- **Multiple Network Topologies**: Support for various network configurations (SIMPLE, UNIDIR, etc.)
+- **Deep Reinforcement Learning**: Uses MaskablePPO for intelligent scheduling decisions
+- **Interactive Visualization**: Plotly-based interactive scheduling visualizations
+- **OMNeT++ Export**: Generates .ned and .ini files for network simulation
+- **Comprehensive Metrics**: Latency analysis, link utilization, and convergence tracking
+- **Reproducible Results**: Seed support for deterministic experiments
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+## Quick Start
+
+### Training a Model
+
+```bash
+python ui/train.py --time_steps 100000 --num_flows 50 --topo UNIDIR8 --seed 42
+```
+
+### Testing a Model
+
+```bash
+python ui/test.py --topo UNIDIR8 --num_flows 100 --seed 42
+```
+
+## Project Structure
 
 
 

@@ -130,7 +130,8 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
          best_model_path: str = None, alg: str = 'MaskablePPO', link_rate: int = 100,
          min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
          visualize: bool = True, show_log: bool = True,
-         gcl_threshold: int = 30, plot_gap_dist: bool = True):
+         gcl_threshold: int = 30, plot_gap_dist: bool = True,
+         seed: int | None = None):
     
     # Para la prueba / inferencia forzamos **un solo entorno**
     num_envs = 1
@@ -140,6 +141,16 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
     from tools.log_config import log_config
     from tools.definitions import OUT_DIR
     log_config(os.path.join(OUT_DIR, f'test_{topo}_{num_flows}.log'), level=logging.INFO)
+
+    # Set random seeds for reproducibility
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        try:
+            import torch
+            torch.manual_seed(seed)
+        except Exception:
+            pass
 
     # Siempre usar la ruta predeterminada para la topología y algoritmo
     if best_model_path is None:
@@ -158,7 +169,8 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
         graph, num_flows,
         unidirectional=topo.startswith("UNIDIR"),
         min_payload=min_payload,
-        max_payload=max_payload
+        max_payload=max_payload,
+        seed=seed,
     )
     
     # Debug info: mostrar número de flujos generados
@@ -335,6 +347,8 @@ if __name__ == '__main__':
                         action='store_false',
                         dest='plot_gap_dist',
                         help='Desactiva la gráfica de verificación de gaps')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Semilla para reproducibilidad (por defecto aleatoria)')
     # Se eliminó completamente el parámetro --best_model_path
     
     args = parser.parse_args()
@@ -361,8 +375,9 @@ if __name__ == '__main__':
 
     # La función test ahora determinará automáticamente la ruta del modelo y usará el rango de payload
     test(args.topo, args.num_flows, 0,
-         None, args.alg, args.link_rate, 
+         None, args.alg, args.link_rate,
          min_payload=args.min_payload, max_payload=args.max_payload,
          visualize=args.visualize, show_log=args.show_log,
          gcl_threshold=args.gcl_threshold,
-         plot_gap_dist=args.plot_gap_dist)
+         plot_gap_dist=args.plot_gap_dist,
+         seed=args.seed)
