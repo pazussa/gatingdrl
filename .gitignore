@@ -33,8 +33,8 @@ ENV/
 *.swo
 
 # Output files - mantener estructura pero ignorar contenido
-/out/*
-!/out/.gitkeep
+#/out/*
+#!/out/.gitkeep
 
 # Logs
 *.log
