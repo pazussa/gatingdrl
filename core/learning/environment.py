@@ -24,7 +24,7 @@ from core.learning.env_actions import process_step_action
 # --------------------------------------------------------------------------- #
 #  Entorno TSN / DRL                                                          #
 # --------------------------------------------------------------------------- #
-class NetEnv(gym.Env):
+class NetworkEnvironment(gym.Env):
     """Entorno de simulación TSN para aprendizaje por refuerzo."""
     
     # Usar la constante centralizada en Net
@@ -100,11 +100,11 @@ class NetEnv(gym.Env):
         self.num_flows: int = len(self.flows)
         # Reloj de referencia global (solo para la observación)
         # Se calcula siempre como el próximo evento más cercano
-        self.global_time: int = 0
+        self.sim_time: int = 0
         self.flow_progress: List[int] = [0] * self.num_flows  # hop en curso de cada flujo
         self.flow_completed: List[bool] = [False] * self.num_flows
         self.flow_first_tx: List[int | None] = [None] * self.num_flows
-        self.current_flow_idx: int = 0                 # para round‑robin
+        self.active_flow_idx: int = 0                 # para round‑robin
 
         self.links_operations = defaultdict(list)
 
@@ -224,15 +224,15 @@ class NetEnv(gym.Env):
             flow_selection: Índice del flujo seleccionado por el agente (0-4)
         """
         # Usar el índice de flujo seleccionado por el agente si está disponible
-        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
-            if 0 <= flow_selection < len(self.current_candidate_flows):
-                selected_idx = self.current_candidate_flows[flow_selection]
+        if hasattr(self, 'candidate_flow_indices') and self.candidate_flow_indices:
+            if 0 <= flow_selection < len(self.candidate_flow_indices):
+                selected_idx = self.candidate_flow_indices[flow_selection]
                 if not self.flow_completed[selected_idx]:
-                    self.current_flow_idx = selected_idx
+                    self.active_flow_idx = selected_idx
                     return
 
         # Si la selección directa falla, usar FIFO como fallback
-        now = self.global_time
+        now = self.sim_time
         chosen = None  # (idx, wait_time)
 
         for idx, done in enumerate(self.flow_completed):
@@ -255,21 +255,21 @@ class NetEnv(gym.Env):
                 chosen = (idx, wait_time)
 
         if chosen:
-            self.current_flow_idx = chosen[0]
+            self.active_flow_idx = chosen[0]
             return
                 
         # Si no se encontró un flujo adecuado, buscar cualquier flujo no completado
-        if self.flow_completed[self.current_flow_idx]:
+        if self.flow_completed[self.active_flow_idx]:
             for idx, completed in enumerate(self.flow_completed):
                 if not completed:
-                    self.current_flow_idx = idx
+                    self.active_flow_idx = idx
                     return
 
     def current_flow(self):
-        return self.flows[self.current_flow_idx]
+        return self.flows[self.active_flow_idx]
 
     def current_link(self):
-        idx = self.flow_progress[self.current_flow_idx]
+        idx = self.flow_progress[self.active_flow_idx]
         flow = self.current_flow()
         return self.link_dict[flow.path[idx]]
 
@@ -289,7 +289,7 @@ class NetEnv(gym.Env):
         best: tuple[int, int, bool, int] | None = None   # (wait_time, -idx, is_in_switch, hop_idx)
         best_idx: int | None = None
 
-        now = self.global_time
+        now = self.sim_time
         for idx, done in enumerate(self.flow_completed):
             if done:
                 continue
@@ -359,11 +359,11 @@ class NetEnv(gym.Env):
                 
             self.consecutive_successes = 0
 
-        self.global_time = 0
+        self.sim_time = 0
         self.flow_progress = [0] * self.num_flows
         self.flow_completed = [False] * self.num_flows
         self.flow_first_tx = [None] * self.num_flows
-        self.current_flow_idx = 0
+        self.active_flow_idx = 0
 
         self.links_operations.clear()
         self.links_gcl = {}   # reiniciar placeholder
@@ -391,7 +391,7 @@ class NetEnv(gym.Env):
         # La observación tendrá: [características_globales, características_flujo1, características_flujo2, ...]
         
         # 1. Características globales de la red
-        global_time_norm = self.global_time / 10000  # Normalizar tiempo global
+        sim_time_norm = self.sim_time / 10000  # Normalizar tiempo global
         
         # Ya no hay GCL dinámico → utilización 0 siempre
         gcl_util_norm = 0.0
@@ -403,7 +403,7 @@ class NetEnv(gym.Env):
         curriculum_norm = self.current_complexity
         
         # Vector de características globales
-        global_features = [global_time_norm, gcl_util_norm, completion_rate, curriculum_norm]
+        global_features = [sim_time_norm, gcl_util_norm, completion_rate, curriculum_norm]
         
         # 2. Obtener una lista de flujos candidatos para programar
         candidatos = []
@@ -423,7 +423,7 @@ class NetEnv(gym.Env):
                     prev_ops = self.links_operations.get(self.link_dict[prev_link_id], [])
                     if prev_ops:
                         prev_op = prev_ops[-1][1]
-                        wait_time = max(0, self.global_time - prev_op.reception_time)
+                        wait_time = max(0, self.sim_time - prev_op.reception_time)
                 
                 # Normalizar valores - convertir a características significativas 
                 period_norm = flow.period / 10000  # Períodos más cortos → valores más pequeños
@@ -433,7 +433,7 @@ class NetEnv(gym.Env):
                 
                 # Calcular urgencia basada en plazo próximo
                 # Cuanto menor sea el tiempo hasta el deadline, mayor urgencia (1.0 = muy urgente)
-                deadline_remaining = (flow.period - (self.global_time % flow.period)) / flow.period
+                deadline_remaining = (flow.period - (self.sim_time % flow.period)) / flow.period
                 urgency = 1.0 - deadline_remaining  # 0.0 = acaba de empezar, 1.0 = casi vencido
                 
                 # Log del flujo candidato con sus características para depuración
@@ -462,11 +462,11 @@ class NetEnv(gym.Env):
             candidatos.append((-1, [0.0, 0.0, 0.0, 0.0, 0.0]))
         
         # 5. Actualizar los índices de flujos candidatos para recuperarlos después
-        self.current_candidate_flows = [idx for idx, _ in candidatos if idx >= 0]
+        self.candidate_flow_indices = [idx for idx, _ in candidatos if idx >= 0]
         
         # Registro para depuración
-        if self.current_candidate_flows:
-            self.logger.debug(f"Candidatos ordenados: {[self.flows[idx].flow_id for idx in self.current_candidate_flows]}")
+        if self.candidate_flow_indices:
+            self.logger.debug(f"Candidatos ordenados: {[self.flows[idx].flow_id for idx in self.candidate_flow_indices]}")
         
         # 6. Construir la observación completa concatenando características
         obs = np.array(global_features + [feat for _, feats in candidatos for feat in feats], dtype=np.float32)
@@ -487,9 +487,9 @@ class NetEnv(gym.Env):
         mask = np.zeros(mask_size, dtype=np.int8)
         
         try:
-            if self.current_flow_idx < len(self.flows) and not self.flow_completed[self.current_flow_idx]:
+            if self.active_flow_idx < len(self.flows) and not self.flow_completed[self.active_flow_idx]:
                 flow = self.current_flow()
-                hop_idx = self.flow_progress[self.current_flow_idx]
+                hop_idx = self.flow_progress[self.active_flow_idx]
                 
                 if hop_idx < len(flow.path):
                     link = self.link_dict[flow.path[hop_idx]]
@@ -571,4 +571,7 @@ class NetEnv(gym.Env):
 
     def close(self):
         pass
+
+# Alias para mantener compatibilidad con el nombre anterior
+NetEnv = NetworkEnvironment
 

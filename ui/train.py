@@ -26,7 +26,7 @@ from core.learning.encoder import FeaturesExtractor
 # Importar MaskablePPO directamente
 from sb3_contrib import MaskablePPO
 from core.scheduler.scheduler import DrlScheduler
-from core.learning.environment import NetEnv # Eliminar TrainingNetEnv
+from core.learning.environment import NetworkEnvironment
 from tools.log_config import log_config
 from core.network.net import FlowGenerator, UniDirectionalFlowGenerator, generate_graph, Network
 from tools.definitions import OUT_DIR, LOG_DIR
@@ -82,9 +82,9 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
         network = Network(graph, flows)
         
         # Crear entorno con curriculum learning adaptativo
-        env = NetEnv(
-            network, 
-            curriculum_enabled=use_curriculum,  
+        env = NetworkEnvironment(
+            network,
+            curriculum_enabled=use_curriculum,
             initial_complexity=0.25 if use_curriculum else 1.0,  # Si no hay curriculum, usar 100% de complejidad
             curriculum_step=0.05      # Incrementar 5% por cada éxito
         )

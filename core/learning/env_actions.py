@@ -66,7 +66,7 @@ def process_step_action(self, action):
     }
 
     flow = self.current_flow()
-    hop_idx = self.flow_progress[self.current_flow_idx]
+    hop_idx = self.flow_progress[self.active_flow_idx]
     link = self.link_dict[flow.path[hop_idx]]
     gating = True
     trans_time = link.transmission_time(flow.payload)

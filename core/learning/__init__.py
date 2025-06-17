@@ -2,7 +2,7 @@
 Entornos y componentes de aprendizaje por refuerzo
 """
 
-from .environment import NetEnv  # La misma exportación para mantener compatibilidad
+from .environment import NetworkEnvironment, NetEnv  # Exportar ambos nombres para compatibilidad
 
 
 

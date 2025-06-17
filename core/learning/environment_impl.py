@@ -39,15 +39,15 @@ def step(self, action):
         
         # IMPORTANTE: Aplicar la selección de flujo inmediatamente
         flow_reward_adj = 0.0
-        original_flow_idx = self.current_flow_idx  # Guardar para comprobar si cambió
+        original_flow_idx = self.active_flow_idx  # Guardar para comprobar si cambió
         
-        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
-            if 0 <= flow_selection < len(self.current_candidate_flows):
-                selected_idx = self.current_candidate_flows[flow_selection]
+        if hasattr(self, 'candidate_flow_indices') and self.candidate_flow_indices:
+            if 0 <= flow_selection < len(self.candidate_flow_indices):
+                selected_idx = self.candidate_flow_indices[flow_selection]
                 if not self.flow_completed[selected_idx]:
                     # Verificar que el flujo seleccionado tiene un hop válido para programar
                     if self.flow_progress[selected_idx] < len(self.flows[selected_idx].path):
-                        self.current_flow_idx = selected_idx
+                        self.active_flow_idx = selected_idx
                         
                         # Añadir información de debug para seguimiento
                         # ↓  Pasa a DEBUG para no saturar la consola
@@ -55,7 +55,7 @@ def step(self, action):
                             "Agente seleccionó flujo %s (idx %d) de candidatos: %s",
                             self.flows[selected_idx].flow_id,
                             selected_idx,
-                            [self.flows[idx].flow_id for idx in self.current_candidate_flows],
+                            [self.flows[idx].flow_id for idx in self.candidate_flow_indices],
                         )
                         
                         # Evaluar si la selección fue buena basándose en características
@@ -82,11 +82,11 @@ def step(self, action):
             # No quedan flujos pendientes – debería terminar normalmente
             return self._get_observation(), 0, True, False, {"success": True}
 
-        if self.current_flow_idx != fifo_idx:
+        if self.active_flow_idx != fifo_idx:
             # Priorizar la transmisión desde switches
-            prev_flow = self.flows[self.current_flow_idx]
+            prev_flow = self.flows[self.active_flow_idx]
             new_flow = self.flows[fifo_idx]
-            prev_hop_idx = self.flow_progress[self.current_flow_idx]
+            prev_hop_idx = self.flow_progress[self.active_flow_idx]
             new_hop_idx = self.flow_progress[fifo_idx]
             
             # Verificar si es un cambio a un flujo que está en un switch esperando
@@ -99,7 +99,7 @@ def step(self, action):
                     self.logger.debug(f"Priorizando transmisión inmediata desde switch: flujo {new_flow.flow_id}")
             
             # Actualizar el flujo actual
-            self.current_flow_idx = fifo_idx
+            self.active_flow_idx = fifo_idx
 
         # A partir de aquí TODO el código sigue igual: ya trabajamos con el
         # flujo correcto; si posteriormente no cabe en el período, se lanzará
@@ -117,15 +117,15 @@ def step(self, action):
         # ------------------------------------------------------------ #
         if hop_idx == 0:        # ---------- primer hop ----------
             # Registrar *exactamente* el instante en que se libera el primer bit
-            # del paquete en el cliente → op.start_time (no global_time).
-            if self.flow_first_tx[self.current_flow_idx] is None:
+            # del paquete en el cliente → op.start_time (no sim_time).
+            if self.flow_first_tx[self.active_flow_idx] is None:
                 # El objeto `op` se crea unas líneas más abajo; de momento
                 # guardamos el valor provisional y lo sobrescribiremos enseguida.
-                self.flow_first_tx[self.current_flow_idx] = -1
+                self.flow_first_tx[self.active_flow_idx] = -1
 
             # Si no se entrega una red, construir topología y flujos sencillos
-            if self.flow_first_tx[self.current_flow_idx] is None:
-                self.flow_first_tx[self.current_flow_idx] = self.global_time
+            if self.flow_first_tx[self.active_flow_idx] is None:
+                self.flow_first_tx[self.active_flow_idx] = self.sim_time
             # ❶  Primer hop: basta con que el enlace esté libre
             # ➡️  Sólo el *primer* enlace respeta Net.PACKET_GAP_EXTRA
             earliest = max(
@@ -176,8 +176,8 @@ def step(self, action):
             op.guard_time        = guard_time        # longitud real del guard-band
 
             # ⏱️  ahora sí: fijamos el instante real de partida
-            if self.flow_first_tx[self.current_flow_idx] == -1:
-                self.flow_first_tx[self.current_flow_idx] = op_start_time
+            if self.flow_first_tx[self.active_flow_idx] == -1:
+                self.flow_first_tx[self.active_flow_idx] = op_start_time
 
         else:                   # ---------- hops siguientes ----------
             # ❷  Resto de hops:
@@ -325,7 +325,7 @@ def step(self, action):
     except SchedulingError as e:
         # Un flujo no cabe en su período ─ cerramos el episodio,
         #  pero entregando TODO lo que sí se ha programado hasta ahora.
-        self.logger.debug(f"Fallo: {e.msg} (flujo {self.current_flow_idx})")
+        self.logger.debug(f"Fallo: {e.msg} (flujo {self.active_flow_idx})")
 
         partial_res = {lnk: ops.copy()          # copia superficial es suficiente
                        for lnk, ops in self.links_operations.items()}
@@ -356,20 +356,20 @@ def step(self, action):
         # para reflejar exactamente la reserva temporal del modelo matemático
         self.switch_busy_until[sw_src] = op.end_time + guard_time
 
-    self.flow_progress[self.current_flow_idx] += 1
+    self.flow_progress[self.active_flow_idx] += 1
 
 
     # ❸  El "reloj" global se redefine como el evento más temprano pendiente
     next_events = [*self.link_busy_until.values(),
                   *self.switch_busy_until.values()]
     # Si no quedan eventos pendientes, mantenemos el reloj en lugar de "rebobinar" a 0
-    self.global_time = min(next_events, default=self.global_time)
+    self.sim_time = min(next_events, default=self.sim_time)
 
     # ¿Terminó este flujo?
-    if self.flow_progress[self.current_flow_idx] == len(flow.path):
-        self.flow_completed[self.current_flow_idx] = True
+    if self.flow_progress[self.active_flow_idx] == len(flow.path):
+        self.flow_completed[self.active_flow_idx] = True
         # ---------- verificación latencia extremo-a-extremo ----------
-        fst = self.flow_first_tx[self.current_flow_idx]
+        fst = self.flow_first_tx[self.active_flow_idx]
         e2e_latency = op.reception_time - fst if fst is not None else 0
         
         # NUEVO: Guardar latencia e2e para estadísticas globales
@@ -405,9 +405,9 @@ def step(self, action):
             
             # Actualizar el reloj global para favorecer el procesamiento inmediato
             # de este paquete que acaba de llegar al switch
-            if arrival_time < self.global_time:
+            if arrival_time < self.sim_time:
                 next_events = [*self.link_busy_until.values(), *self.switch_busy_until.values(), arrival_time]
-                self.global_time = min(next_events)
+                self.sim_time = min(next_events)
 
     # Gestionar el curriculum learning
     if done and all(self.flow_completed):
@@ -450,8 +450,8 @@ def step(self, action):
         },
         # NUEVO: Añadir información sobre selección de flujos
         "flow_selection": {
-            "current_flow_idx": self.current_flow_idx,
-            "available_candidates": getattr(self, 'current_candidate_flows', []),
+            "active_flow_idx": self.active_flow_idx,
+            "available_candidates": getattr(self, 'candidate_flow_indices', []),
             "selected_option": flow_selection,
             "reward_adj": flow_reward_adj
         }
