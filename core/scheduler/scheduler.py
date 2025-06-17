@@ -14,7 +14,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from tools.definitions import OUT_DIR
 from core.network.net import Flow, Link, Network, Net
 from core.network.operation import Operation
-from core.learning.environment import NetEnv
+from core.learning.environment import NetworkEnvironment
 
 # Tipo para resultados
 ScheduleRes = Dict[Link, List[Tuple[Flow, Operation]]]
@@ -35,7 +35,7 @@ class DrlScheduler:
         # ──────────────────────────────────────────────────────────────
         self.num_envs = 1
         self.env = DummyVecEnv([
-            lambda: NetEnv(
+            lambda: NetworkEnvironment(
                 network,
                 curriculum_enabled=use_curriculum,
                 initial_complexity=1.0   # 100 % de los flujos en test
