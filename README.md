@@ -1,4 +1,5 @@
 # gatingdrl – Scheduling TSN con Deep RL
+#alter
 
 Proyecto para generar Gate Control Lists en redes
 Time-Sensitive Networking (TSN) mediante **Maskable PPO**.  
