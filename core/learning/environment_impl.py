@@ -12,7 +12,7 @@ import logging
 
 def step(self, action):
     """
-    Realiza un paso en el entorno según la acción proporcionada.
+    Ejecuta un paso en el entorno con la acción dada.
     
     Este método implementa la lógica principal para:
     - Procesar la acción del agente
@@ -39,6 +39,7 @@ def step(self, action):
         
         # IMPORTANTE: Aplicar la selección de flujo inmediatamente
         flow_reward_adj = 0.0
+        agent_selected = False                     # Controla si se aplicó la selección RL
         original_flow_idx = self.current_flow_idx  # Guardar para comprobar si cambió
         
         if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
@@ -48,6 +49,7 @@ def step(self, action):
                     # Verificar que el flujo seleccionado tiene un hop válido para programar
                     if self.flow_progress[selected_idx] < len(self.flows[selected_idx].path):
                         self.current_flow_idx = selected_idx
+                        agent_selected = True
                         
                         # Añadir información de debug para seguimiento
                         # ↓  Pasa a DEBUG para no saturar la consola
@@ -82,7 +84,8 @@ def step(self, action):
             # No quedan flujos pendientes – debería terminar normalmente
             return self._get_observation(), 0, True, False, {"success": True}
 
-        if self.current_flow_idx != fifo_idx:
+        # Respetar la selección del agente salvo que no haya seleccionado
+        if not agent_selected and self.current_flow_idx != fifo_idx:
             # Priorizar la transmisión desde switches
             prev_flow = self.flows[self.current_flow_idx]
             new_flow = self.flows[fifo_idx]
