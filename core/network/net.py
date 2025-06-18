@@ -7,7 +7,7 @@ import typing
 
 
 # Conjunto de períodos disponibles
-PERIOD_SET = [2000,4000,8000]
+PERIOD_SET = [1000]
 
 class Net:
     # Configuración de red y temporizaciones

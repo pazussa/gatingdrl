@@ -77,6 +77,27 @@ python ui/train.py --time_steps 100000 --num_flows 50 --topo UNIDIR8 --seed 42
 python ui/test.py --topo UNIDIR8 --num_flows 100 --seed 42
 ```
 
+## Reproducibility
+
+Use the `--seed` parameter to ensure reproducible results:
+
+```bash
+# Training with reproducible results
+python ui/train.py --time_steps 50000 --topo UNIDIR --num_flows 49 \
+                   --link_rate 1000 --min-payload 800 --max-payload 1500 \
+                   --seed 42
+```
+
+Curriculum learning is disabled by default for more stable training. Use `--curriculum` to gradually increase difficulty.
+
+```bash
+# Testing with same seed
+python ui/test.py --topo UNIDIR --num_flows 30 \
+                  --alg MaskablePPO --link_rate 1000 \
+                  --min-payload 1000 --max-payload 1500 \
+                  --seed 42
+```
+
 ## Project Structure
 
 

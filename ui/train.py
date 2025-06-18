@@ -539,8 +539,8 @@ def main():
                         help='Umbral (µs) para generar entradas GCL')
                         
     # Añadir opción para controlar el curriculum learning
-    parser.add_argument('--curriculum', action='store_true', default=True,
-                      help='Usar curriculum learning adaptativo (por defecto activado)')
+    parser.add_argument('--curriculum', action='store_true', default=False,
+                      help='Activar curriculum learning adaptativo')
     parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
                       help='Desactivar curriculum learning adaptativo')
    
