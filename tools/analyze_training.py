@@ -61,6 +61,10 @@ def analyze_rewards(metrics, save_dir=None):
     # Estadísticas de recompensas
     plt.axhline(y=np.mean(rewards), color='g', linestyle='--', label=f'Media: {np.mean(rewards):.2f}')
     
+    # Set Y-axis to start from 0
+    max_reward = max(rewards)
+    plt.ylim(0, max_reward * 1.05)  # Start from 0, add 5% padding at top
+    
     # Tramos de análisis
     n = len(rewards)
     if n >= 30:  # Solo si hay suficientes episodios

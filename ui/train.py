@@ -9,7 +9,6 @@ import sys
 import shutil  # Para eliminar directorios recursivamente
 import time
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.utils import set_random_seed
 
 
 # Add Qt platform environment variable before any imports that might use Qt
@@ -61,16 +60,10 @@ def get_best_model_file(topo=TOPO, alg=DRL_ALG):
     return os.path.join(get_best_model_path(topo, alg), "best_model.zip")
 
 
-def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True, link_rate: int = 100,
+def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True, link_rate: int = 100, 
              min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
-             use_curriculum: bool = True, seed: int | None = None):
+             use_curriculum: bool = True):
     def _init():
-        # Set environment-specific seeds
-        if seed is not None:
-            random.seed(seed + rank)
-            np.random.seed(seed + rank)
-            set_random_seed(seed + rank)
-            
         graph = generate_graph(topo, link_rate)
 
         # Simplificar - eliminar jitters
@@ -78,19 +71,9 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
         is_unidir = topo.startswith("UNIDIR")
         # Pasar el rango de payload al generador
         if is_unidir:
-            flow_generator = UniDirectionalFlowGenerator(
-                graph,
-                seed=seed + rank if seed is not None else None,
-                min_payload=min_payload,
-                max_payload=max_payload,
-            )
+            flow_generator = UniDirectionalFlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
         else:
-            flow_generator = FlowGenerator(
-                graph,
-                seed=seed + rank if seed is not None else None,
-                min_payload=min_payload,
-                max_payload=max_payload,
-            )
+            flow_generator = FlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
 
         # Generar todos los flujos - asegurarse de crear exactamente el número solicitado
         flows = flow_generator(num_flows)
@@ -108,16 +91,12 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
 
         # Wrap the environment with Monitor
         env = Monitor(env, os.path.join(monitor_dir, f'{"train" if training else "eval"}_{rank}'))
-        if seed is not None:
-            env.reset(seed=seed + rank)
         return env
 
     return _init
 
 
-def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None,
-          link_rate: int = 100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
-          use_curriculum: bool = True, show_log: bool = True, seed: int | None = None):
+def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True, show_log: bool = True):
     # ────────────────────────────────────────────────────────────────
     #  NUEVO: Limpiar completamente el directorio de salida
     # ────────────────────────────────────────────────────────────────
@@ -136,26 +115,29 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
     env = SubprocVecEnv([
         # Ya no hay distinción entre entornos de entrenamiento y evaluación,
         # ambos usan la configuración completa de num_flows desde el principio
-        make_env(num_flows, i, topo, monitor_dir, link_rate=link_rate,
-                 min_payload=min_payload, max_payload=max_payload,
-                 use_curriculum=use_curriculum, seed=seed)
+        make_env(num_flows, i, topo, monitor_dir, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=use_curriculum)  # Pasar flag de curriculum
         for i in range(n_envs)
         ])
 
-    if pre_trained_model is not None:
+    # FORZAR ENTRENAMIENTO DESDE CERO - No cargar modelo pre-entrenado por defecto
+    if pre_trained_model is not None and os.path.exists(pre_trained_model):
+        logging.info(f"Cargando modelo pre-entrenado: {pre_trained_model}")
         model = MaskablePPO.load(pre_trained_model, env)
     else:
+        if pre_trained_model is not None:
+            logging.warning(f"Modelo pre-entrenado especificado no existe: {pre_trained_model}")
+        
+        logging.info("Iniciando entrenamiento DESDE CERO (sin modelo pre-entrenado)")
         policy_kwargs = dict(
             features_extractor_class=FeaturesExtractor,
         )
 
-        # Usar siempre MaskablePPO sin condicionales
+        # Crear modelo completamente nuevo sin cargar ningún modelo previo
         model = MaskablePPO("MlpPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
 
     eval_env = SubprocVecEnv([
-        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate,
-                 min_payload=min_payload, max_payload=max_payload, use_curriculum=False,
-                 seed=seed)
+        # El entorno de evaluación también usa la misma configuración
+        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False)
         for i in range(n_envs)
         ])
     
@@ -320,12 +302,12 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
         StrictTimestepCallback(num_time_steps)  # Este tiene la prioridad final
     ]
 
-    # Entrenar con configuración más estricta
+    # Entrenar con configuración más estricta - FORZAR RESET COMPLETO
     model.learn(
         total_timesteps=num_time_steps,
         callback=callbacks,
         progress_bar=True,
-        reset_num_timesteps=True
+        reset_num_timesteps=True  # ← CRUCIAL: resetear completamente los timesteps
     )
     
     # Verificar timesteps finales con mayor detalle
@@ -490,6 +472,12 @@ def plot_results(log_folder, title="Learning Curve"):
         plt.xlabel("Number of Timesteps")
         plt.ylabel("Rewards")
         plt.title(title + " Smoothed")
+        
+        # Set Y-axis to start from 0 and go to max value with some padding
+        if len(y) > 0:
+            max_reward = max(y)
+            plt.ylim(0, max_reward * 1.05)  # Add 5% padding at the top
+        
         plt.savefig(os.path.join(log_folder, "reward.png"))
         
         # Use non-blocking display and catch any errors
@@ -539,15 +527,11 @@ def main():
                         help='Umbral (µs) para generar entradas GCL')
                         
     # Añadir opción para controlar el curriculum learning
-    parser.add_argument('--curriculum', action='store_true', default=False,
-                      help='Activar curriculum learning adaptativo')
+    parser.add_argument('--curriculum', action='store_true', default=True,
+                      help='Usar curriculum learning adaptativo (por defecto activado)')
     parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
                       help='Desactivar curriculum learning adaptativo')
    
-    # NUEVO: Añadir argumento para la semilla
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Semilla para reproducibilidad (por defecto aleatoria)')
-    
     args = parser.parse_args()
 
 
@@ -605,8 +589,7 @@ def main():
           min_payload=args.min_payload, # Pasar min/max payload
           max_payload=args.max_payload,
           use_curriculum=args.curriculum,
-          show_log=args.show_log,
-          seed=args.seed)  # ← NUEVO: Pasar show_log y seed
+          show_log=args.show_log)  # ← NUEVO: Pasar show_log
 
     # Add try-except block around plotting
     try:
@@ -629,8 +612,7 @@ def main():
         max_payload=args.max_payload,
         visualize=args.visualize,
         show_log=args.show_log,  # ← NUEVO: Pasar show_log también a test
-        gcl_threshold=args.gcl_threshold,
-        seed=args.seed
+        gcl_threshold=args.gcl_threshold
     )
 
 if __name__ == "__main__":

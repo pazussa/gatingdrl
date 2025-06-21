@@ -12,7 +12,7 @@ import logging
 
 def step(self, action):
     """
-    Ejecuta un paso en el entorno con la acción dada.
+    Realiza un paso en el entorno según la acción proporcionada.
     
     Este método implementa la lógica principal para:
     - Procesar la acción del agente
@@ -287,11 +287,11 @@ def step(self, action):
             # Recrear la operación con los nuevos tiempos
             op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
             
-            # Validar que la operación se mantiene dentro del período del flujo
-            if op_end_time > flow.period:
+            # Si hay gating, validar que aún está dentro del período del flujo
+            if op_gating_time is not None and op_end_time > flow.period:
                 # El inicio real ocurriría después del final del período
                 raise SchedulingError(
-                    ErrorType.PeriodExceed,
+                    ErrorType.PeriodExceed, 
                     "Flow cycles into next period"
                 )
             
