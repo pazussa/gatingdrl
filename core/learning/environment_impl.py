@@ -10,7 +10,7 @@ import math, statistics as _stat
 import logging
 
 
-def step(self, action):
+def step(self, command):
     """
     Realiza un paso en el entorno según la acción proporcionada.
     
@@ -22,464 +22,541 @@ def step(self, action):
     - Calcular la recompensa
     
     Args:
-        action: Acción multidimensional del agente RL
+        command: Acción multidimensional del agente RL
         
     Returns:
-        Tuple: (observación, recompensa, terminado, truncado, info)
+        Tuple: (observación, recompensa, terminado, truncado, metadata)
     """
     try:
         # ──────────────────────────────────────────────────────────────
         #  Inicializar métricas de latencia a 0 – se actualizarán al final
         #  del episodio si todos los flujos se completan con éxito.
         # ──────────────────────────────────────────────────────────────
-        avg_lat = jitter = max_lat = 0
+        mean_delay = delay_variance = peak_delay = 0
 
         # NUEVO: Extraer la selección de flujo de la acción y aplicarla ANTES de procesar
-        flow_selection = int(action[-1])  # La última dimensión es la selección de flujo
+        stream_choice = int(command[-1])  # La última dimensión es la selección de flujo
         
         # IMPORTANTE: Aplicar la selección de flujo inmediatamente
-        flow_reward_adj = 0.0
-        agent_selected = False                     # Controla si se aplicó la selección RL
-        original_flow_idx = self.current_flow_idx  # Guardar para comprobar si cambió
+        selection_bonus = 0.0
+        policy_applied = False                     # Controla si se aplicó la selección RL
+        backup_stream_id = self.active_stream_id  # Guardar para comprobar si cambió
         
-        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
-            if 0 <= flow_selection < len(self.current_candidate_flows):
-                selected_idx = self.current_candidate_flows[flow_selection]
-                if not self.flow_completed[selected_idx]:
+        if hasattr(self, 'active_nominees') and self.active_nominees:
+            if 0 <= stream_choice < len(self.active_nominees):
+                chosen_identifier = self.active_nominees[stream_choice]
+                if not self.stream_finished[chosen_identifier]:
                     # Verificar que el flujo seleccionado tiene un hop válido para programar
-                    if self.flow_progress[selected_idx] < len(self.flows[selected_idx].path):
-                        self.current_flow_idx = selected_idx
-                        agent_selected = True
+                    if self.stream_advancement[chosen_identifier] < len(self.traffic_streams[chosen_identifier].path):
+                        self.active_stream_id = chosen_identifier
+                        policy_applied = True
                         
                         # Añadir información de debug para seguimiento
                         # ↓  Pasa a DEBUG para no saturar la consola
-                        self.logger.debug(
-                            "Agente seleccionó flujo %s (idx %d) de candidatos: %s",
-                            self.flows[selected_idx].flow_id,
-                            selected_idx,
-                            [self.flows[idx].flow_id for idx in self.current_candidate_flows],
+                        self.event_recorder.debug(
+                            "Agente seleccionó flujo %s (identifier %d) de nominees: %s",
+                            self.traffic_streams[chosen_identifier].flow_id,
+                            chosen_identifier,
+                            [self.traffic_streams[identifier].flow_id for identifier in self.active_nominees],
                         )
                         
                         # Evaluar si la selección fue buena basándose en características
-                        selected_flow = self.flows[selected_idx]
+                        chosen_stream = self.traffic_streams[chosen_identifier]
                         
                         # Calcular recompensa por selección inteligente
-                        period_factor   = 1.0 - (selected_flow.period / 10000)
-                        payload_factor  = 1.0 - (selected_flow.payload / Net.MTU)
-                        remaining       = len(selected_flow.path) - self.flow_progress[selected_idx]
-                        progress_factor = remaining / len(selected_flow.path)
+                        frequency_coefficient   = 1.0 - (chosen_stream.period / 10000)
+                        size_coefficient  = 1.0 - (chosen_stream.payload / Net.MTU)
+                        pending_segments       = len(chosen_stream.path) - self.stream_advancement[chosen_identifier]
+                        completion_ratio = pending_segments / len(chosen_stream.path)
 
-                        flow_reward_adj = (period_factor * 0.15 +
-                                           payload_factor * 0.15 +
-                                           progress_factor * 0.15)
+                        selection_bonus = (frequency_coefficient * 0.15 +
+                                           size_coefficient * 0.15 +
+                                           completion_ratio * 0.15)
                         
-                        self.logger.debug(f"Flow selection: {flow_selection} → candidate #{selected_idx} (Flow {selected_flow.flow_id})")
-                        self.logger.debug(f"Flow reward adjustment: +{flow_reward_adj:.4f}")
+                        self.event_recorder.debug(f"Flow selection: {stream_choice} → candidate #{chosen_identifier} (Flow {chosen_stream.flow_id})")
+                        self.event_recorder.debug(f"Flow performance_score adjustment: +{selection_bonus:.4f}")
         
         # ──────────────────────────────────────────────────────────────
         #  ENFORCE PRIORITY SCHEDULING - IMMEDIATE FORWARDING FROM SWITCHES
         # ──────────────────────────────────────────────────────────────
-        fifo_idx = self._next_fifo_idx()
-        if fifo_idx is None:
+        queue_position = self._next_fifo_idx()
+        if queue_position is None:
             # No quedan flujos pendientes – debería terminar normalmente
             return self._get_observation(), 0, True, False, {"success": True}
 
         # Respetar la selección del agente salvo que no haya seleccionado
-        if not agent_selected and self.current_flow_idx != fifo_idx:
+        if not policy_applied and self.active_stream_id != queue_position:
             # Priorizar la transmisión desde switches
-            prev_flow = self.flows[self.current_flow_idx]
-            new_flow = self.flows[fifo_idx]
-            prev_hop_idx = self.flow_progress[self.current_flow_idx]
-            new_hop_idx = self.flow_progress[fifo_idx]
+            previous_stream = self.traffic_streams[self.active_stream_id]
+            next_stream = self.traffic_streams[queue_position]
+            prior_segment = self.stream_advancement[self.active_stream_id]
+            next_segment = self.stream_advancement[queue_position]
             
             # Verificar si es un cambio a un flujo que está en un switch esperando
-            if new_hop_idx > 0:
-                prev_link_id = new_flow.path[new_hop_idx - 1]
-                dst_node = prev_link_id[1] if isinstance(prev_link_id, tuple) else prev_link_id.split('-')[1]
-                is_at_switch = dst_node.startswith('S') and not dst_node.startswith('SRV')
+            if next_segment > 0:
+                upstream_identifier = next_stream.path[next_segment - 1]
+                target_endpoint = upstream_identifier[1] if isinstance(upstream_identifier, tuple) else upstream_identifier.split('-')[1]
+                at_network_node = target_endpoint.startswith('S') and not target_endpoint.startswith('SRV')
                 
-                if is_at_switch:
-                    self.logger.debug(f"Priorizando transmisión inmediata desde switch: flujo {new_flow.flow_id}")
+                if at_network_node:
+                    self.event_recorder.debug(f"Priorizando transmisión inmediata desde switch: flujo {next_stream.flow_id}")
             
             # Actualizar el flujo actual
-            self.current_flow_idx = fifo_idx
+            self.active_stream_id = queue_position
 
         # A partir de aquí TODO el código sigue igual: ya trabajamos con el
         # flujo correcto; si posteriormente no cabe en el período, se lanzará
         # el SchedulingError habitual y el episodio terminará "con error".
         
         # Procesar la acción y obtener la información necesaria
-        # ➋  Desestructuramos el nuevo elemento `guard_factor`
-        (flow, hop_idx, link, gating, trans_time,
-         guard_time, guard_factor,                # ← aquí
-         offset_us, switch_gap, sw_src,
-         is_egress_from_switch, gcl_strategy) = process_step_action(self, action)
+        # ➋  Desestructuramos el nuevo elemento `protection_multiplier`
+        (data_stream, segment_index, network_connection, time_synchronization, transmission_duration,
+         safety_interval, protection_multiplier,                # ← aquí
+         timing_offset, inter_packet_spacing, sw_src,
+         outbound_from_switch, scheduling_policy) = process_step_action(self, command)
 
         # ------------------------------------------------------------ #
         # 1. Calcular tiempos                                          #
         # ------------------------------------------------------------ #
-        if hop_idx == 0:        # ---------- primer hop ----------
+        if segment_index == 0:        # ---------- primer hop ----------
             # Registrar *exactamente* el instante en que se libera el primer bit
-            # del paquete en el cliente → op.start_time (no global_time).
-            if self.flow_first_tx[self.current_flow_idx] is None:
-                # El objeto `op` se crea unas líneas más abajo; de momento
+            # del paquete en el cliente → operation_record.start_time (no simulation_clock).
+            if self.initial_transmission[self.active_stream_id] is None:
+                # El objeto `operation_record` se crea unas líneas más abajo; de momento
                 # guardamos el valor provisional y lo sobrescribiremos enseguida.
-                self.flow_first_tx[self.current_flow_idx] = -1
+                self.initial_transmission[self.active_stream_id] = -1
 
             # Si no se entrega una red, construir topología y flujos sencillos
-            if self.flow_first_tx[self.current_flow_idx] is None:
-                self.flow_first_tx[self.current_flow_idx] = self.global_time
+            if self.initial_transmission[self.active_stream_id] is None:
+                self.initial_transmission[self.active_stream_id] = self.simulation_clock
             # ❶  Primer hop: basta con que el enlace esté libre
             # ➡️  Sólo el *primer* enlace respeta Net.PACKET_GAP_EXTRA
-            earliest = max(
-                self.link_busy_until[link],
-                self.global_queue_busy_until,
+            minimum_start = max(
+                self.connection_free_time[network_connection],
+                self.system_busy_time,
                 self.last_packet_start + self._next_packet_gap()
-            )  # Removed offset_us
+            )  # Removed timing_offset
             # Obtener el switch de destino para este paquete
-            dst_node = link.link_id[1] if isinstance(link.link_id, tuple) else link.link_id.split('-')[1]
-            if dst_node.startswith('S'):
+            target_endpoint = network_connection.link_id[1] if isinstance(network_connection.link_id, tuple) else network_connection.link_id.split('-')[1]
+            if target_endpoint.startswith('S'):
                 # Asegurar separación mínima de 1μs entre llegadas al switch
                 # Calcula el tiempo de llegada *potencial* al switch
-                potential_arrival_time = earliest + trans_time + Net.DELAY_PROP
-                min_arrival_time = self.switch_last_arrival[dst_node] + switch_gap
-                if potential_arrival_time < min_arrival_time:
+                estimated_arrival = minimum_start + transmission_duration + Net.DELAY_PROP
+                minimum_ingress = self.node_last_reception[target_endpoint] + inter_packet_spacing
+                if estimated_arrival < minimum_ingress:
                     # Ajustar el tiempo de inicio para garantizar 1μs de separación en destino
-                    delay = min_arrival_time - potential_arrival_time
-                    earliest += delay
+                    latency_offset = minimum_ingress - estimated_arrival
+                    minimum_start += latency_offset
                     # Actualizar el tiempo de llegada real
-                    arrival_time = min_arrival_time
+                    reception_instant = minimum_ingress
                 else:
-                    arrival_time = potential_arrival_time
+                    reception_instant = estimated_arrival
                 # Actualizar el último tiempo de llegada registrado para este switch
-                self.switch_last_arrival[dst_node] = arrival_time
+                self.node_last_reception[target_endpoint] = reception_instant
 
             # Re-calcular la ventana tras cualquier retraso aplicado
-            latest = earliest + Net.SYNC_ERROR
+            maximum_time = minimum_start + Net.SYNC_ERROR
 
-            # Para el primer hop desde ES, no hay gating. Dequeue es el inicio más temprano.
-            offset   = 0            # sin margen de sincronía
-            dequeue  = earliest     # comienza tan pronto el enlace queda libre
-            end_time = dequeue + trans_time
-            if end_time > flow.period:
+            # Para el primer hop desde ES, no hay time_synchronization. Dequeue es el inicio más temprano.
+            time_adjustment   = 0            # sin margen de sincronía
+            transmission_start  = minimum_start     # comienza tan pronto el enlace queda libre
+            completion_instant = transmission_start + transmission_duration
+            if completion_instant > data_stream.period:
                  # Primer hop (sale de una ES): no hay switch para crear espera
-                 raise SchedulingError(ErrorType.PeriodExceed, "Excedió período")
+                 raise SchedulingError(ErrorType.DEADLINE_VIOLATION, "Excedió período")
 
-            # --- Crear objeto Operation para hop_idx == 0 ---
-            op_start_time = earliest
-            op_gating_time = None # No hay gating desde ES
-            op_latest_time = latest # Usamos latest calculado
-            op_end_time = end_time
-            # Crear la operación AHORA para que 'op' esté definida
-            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+            # --- Crear objeto Operation para segment_index == 0 ---
+            operation_begin = minimum_start
+            synchronization_time = None # No hay time_synchronization desde ES
+            deadline_time = maximum_time # Usamos maximum_time calculado
+            operation_finish = completion_instant
+            # Crear la operación AHORA para que 'operation_record' esté definida
+            operation_record = Operation(operation_begin, synchronization_time, deadline_time, operation_finish)
 
             # ➕ GUARDAR datos que el visualizador necesita
-            op.guard_factor      = guard_factor      # decisión RL
-            op.min_gap_value     = switch_gap        # decisión RL
-            op.guard_time        = guard_time        # longitud real del guard-band
+            operation_record.protection_multiplier      = protection_multiplier      # decisión RL
+            operation_record.min_gap_value     = inter_packet_spacing        # decisión RL
+            operation_record.safety_interval        = safety_interval        # longitud real del guard-band
 
             # ⏱️  ahora sí: fijamos el instante real de partida
-            if self.flow_first_tx[self.current_flow_idx] == -1:
-                self.flow_first_tx[self.current_flow_idx] = op_start_time
+            if self.initial_transmission[self.active_stream_id] == -1:
+                self.initial_transmission[self.active_stream_id] = operation_begin
 
-        else:                   # ---------- hops siguientes ----------
-            # ❷  Resto de hops:
-            prev_link_id = flow.path[hop_idx - 1]
-            prev_link = self.link_dict[prev_link_id]
-            prev_op = self.links_operations[prev_link][-1][1]
+        else:                   # ---------- path_segments siguientes ----------
+            # ❷  Resto de path_segments:
+            upstream_identifier = data_stream.path[segment_index - 1]
+            upstream_connection = self.connection_registry[upstream_identifier]
+            previous_operation = self.connection_activities[upstream_connection][-1][1]
 
             # Tiempo base: cuando el paquete está listo en el nodo actual
-            packet_ready_time = prev_op.reception_time
+            data_ready_instant = previous_operation.reception_time
 
             # Earliest possible start considerando sólo llegada y disponibilidad del ENLACE
-            # ⚠️  En hops posteriores **no** aplicamos la separación global:
-            earliest_possible_start_on_link = max(packet_ready_time,
-                                         self.link_busy_until[link],
-                                         self.global_queue_busy_until)  # Removed offset_us
+            # ⚠️  En path_segments posteriores **no** aplicamos la separación global:
+            link_availability = max(data_ready_instant,
+                                         self.connection_free_time[network_connection],
+                                         self.system_busy_time)  # Removed timing_offset
 
             # Earliest start considerando también la disponibilidad del PUERTO del SWITCH (si aplica)
-            if is_egress_from_switch:
+            if outbound_from_switch:
                 # FCFS se mantiene, pero no registramos la espera (no la decide el agente)
-                final_earliest_start = max(earliest_possible_start_on_link,
-                                            self.switch_busy_until[sw_src])
+                actual_start_time = max(link_availability,
+                                            self.node_free_time[sw_src])
             else:
-                final_earliest_start = earliest_possible_start_on_link
+                actual_start_time = link_availability
 
-            # Calcular la ventana 'latest' basada en el inicio más temprano real
-            latest = final_earliest_start + Net.SYNC_ERROR
+            # Calcular la ventana 'maximum_time' basada en el inicio más temprano real
+            maximum_time = actual_start_time + Net.SYNC_ERROR
 
             # Determinar el tiempo real de DEQUEUE (inicio de transmisión)
-            offset   = 0            # sin margen de sincronía
-            dequeue  = final_earliest_start
+            time_adjustment   = 0            # sin margen de sincronía
+            transmission_start  = actual_start_time
             
             # Calcular tiempo de fin de transmisión
-            end_time = dequeue + trans_time
-            if end_time > flow.period:
+            completion_instant = transmission_start + transmission_duration
+            if completion_instant > data_stream.period:
                 # Si no cabe en su periodo, abortar sin intentos de recolocación
-                raise SchedulingError(ErrorType.PeriodExceed, "Excedió período")
+                raise SchedulingError(ErrorType.DEADLINE_VIOLATION, "Excedió período")
 
             # --- Crear objeto Operation ---
             # start_time: Cuándo podría haber empezado (llegada + disponibilidad enlace)
-            # gating_time: Cuándo empezó realmente (dequeue), si aplica gating
-            # latest_time: Límite superior de la ventana para gating
-            # end_time: Cuándo terminó la transmisión
-            op_start_time = earliest_possible_start_on_link
-            op_gating_time = dequeue if gating and is_egress_from_switch else None 
-            # Importante: Si hay gating, latest_time debe ser igual a gating_time
-            if gating and is_egress_from_switch:
-                op_latest_time = op_gating_time  # Si hay gating, ambos deben ser iguales
+            # gating_time: Cuándo empezó realmente (transmission_start), si aplica time_synchronization
+            # latest_time: Límite superior de la ventana para time_synchronization
+            # completion_instant: Cuándo terminó la transmisión
+            operation_begin = link_availability
+            synchronization_time = transmission_start if time_synchronization and outbound_from_switch else None 
+            # Importante: Si hay time_synchronization, latest_time debe ser igual a gating_time
+            if time_synchronization and outbound_from_switch:
+                deadline_time = synchronization_time  # Si hay time_synchronization, ambos deben ser iguales
             else:
-                op_latest_time = latest  # Sin gating, latest_time mantiene su valor normal
+                deadline_time = maximum_time  # Sin time_synchronization, latest_time mantiene su valor normal
 
-            op_end_time = end_time
+            operation_finish = completion_instant
 
-            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+            operation_record = Operation(operation_begin, synchronization_time, deadline_time, operation_finish)
 
-            # ➕ Actualizar también en la rama "hops > 0"
-            op.guard_factor  = guard_factor
-            op.min_gap_value = switch_gap
-            op.guard_time    = guard_time
+            # ➕ Actualizar también en la rama "path_segments > 0"
+            operation_record.protection_multiplier  = protection_multiplier
+            operation_record.min_gap_value = inter_packet_spacing
+            operation_record.safety_interval    = safety_interval
             # No guardamos esperas que no sean decisión del agente
 
             # ── Nuevo: garantizar separación mínima entre llegadas al switch destino ──
-            dst_node = link.link_id[1] if isinstance(link.link_id, tuple) \
-                       else link.link_id.split('-')[1]
-            if dst_node.startswith('S'):                       # sólo switches reales
-                arrival = op.reception_time - Net.DELAY_PROC_RX
-                min_arrival = self.switch_last_arrival[dst_node] + switch_gap
-                if arrival < min_arrival:
-                    delay = min_arrival - arrival
-                    op.add(delay)              # ajusta *todos* los tiempos de la operación
-                    op.min_gap_wait += delay   # registrar espera por gap mínimo
-                    dequeue   += delay
-                    end_time  += delay
-                    op_start_time += delay
-                    op_end_time   += delay
-                    arrival = min_arrival
+            target_endpoint = network_connection.link_id[1] if isinstance(network_connection.link_id, tuple) \
+                       else network_connection.link_id.split('-')[1]
+            if target_endpoint.startswith('S'):                       # sólo switches reales
+                ingress_time = operation_record.reception_time - Net.DELAY_PROC_RX
+                earliest_reception = self.node_last_reception[target_endpoint] + inter_packet_spacing
+                if ingress_time < earliest_reception:
+                    latency_offset = int(earliest_reception - ingress_time)  # Convertir a entero
+                    operation_record.add(latency_offset)              # ajusta *todos* los tiempos de la operación
+                    operation_record.min_gap_wait += latency_offset   # registrar espera por gap mínimo
+                    transmission_start   += latency_offset
+                    completion_instant  += latency_offset
+                    operation_begin += latency_offset
+                    operation_finish   += latency_offset
+                    # CRUCIAL: Actualizar también las variables locales para conflict resolution
+                    if synchronization_time is not None:
+                        synchronization_time += latency_offset
+                        deadline_time += latency_offset  # Mantener igualdad deadline_time == synchronization_time
+                    else:
+                        deadline_time += latency_offset
+                    ingress_time = int(earliest_reception)  # También convertir a entero
                 # Registrar llegada para el siguiente paquete
-                self.switch_last_arrival[dst_node] = arrival
+                self.node_last_reception[target_endpoint] = ingress_time
 
         # --- Regla *un‑solo‑paquete‑switch* ---
         # 2. Crear operación temporal                                  #
         # ------------------------------------------------------------ #
-        # op ya está creado con los tiempos correctos
-        self.temp_operations.append((link, op))
+        # operation_record ya está creado con los tiempos correctos
+        self.provisional_activities.append((network_connection, operation_record))
 
         # Resolver conflictos por desplazamiento
-        offset = self._check_temp_operations()
-        max_iter = 16  # salvaguarda contra bucles infinitos
-        while offset is not None and max_iter:
-            # Desplazar la operación según el offset de conflicto
-            op_start_time += offset
+        time_adjustment = self._check_temp_operations()
+        iteration_limit = 16  # salvaguarda contra bucles infinitos
+        iterations_used = 0  # Contador para métricas
+        
+        while time_adjustment is not None and iteration_limit:
+            iterations_used += 1
+            # Desplazar la operación según el time_adjustment de conflicto
+            operation_begin += time_adjustment
             
             # Actualizar TODAS las propiedades temporales
-            if op_gating_time is not None:
-                # Con gating, todo se desplaza por igual
-                op_gating_time += offset
-                op_latest_time += offset  # latest siempre alineado con gating
+            if synchronization_time is not None:
+                # Con time_synchronization, todo se desplaza por igual
+                synchronization_time += time_adjustment
+                deadline_time = synchronization_time  # latest_time debe ser igual a gating_time cuando hay time_synchronization
             else:
-                # Sin gating, latest avanza con start (son independientes)
-                op_latest_time += offset
+                # Sin time_synchronization, maximum_time avanza con start (son independientes)
+                deadline_time += time_adjustment
             
             # Tiempo final siempre se recalcula respecto al inicio real
-            op_end_time = (op_gating_time if op_gating_time is not None else op_start_time) + trans_time
+            operation_finish = (synchronization_time if synchronization_time is not None else operation_begin) + transmission_duration
 
             # Recrear la operación con los nuevos tiempos
-            op = Operation(op_start_time, op_gating_time, op_latest_time, op_end_time)
+            operation_record = Operation(operation_begin, synchronization_time, deadline_time, operation_finish)
             
-            # Si hay gating, validar que aún está dentro del período del flujo
-            if op_gating_time is not None and op_end_time > flow.period:
-                # El inicio real ocurriría después del final del período
+            # Validar que la operación está dentro del período del flujo (tanto con como sin time_synchronization)
+            if operation_finish > data_stream.period:
+                # La operación se extiende más allá del final del período
                 raise SchedulingError(
-                    ErrorType.PeriodExceed, 
-                    "Flow cycles into next period"
+                    ErrorType.DEADLINE_VIOLATION, 
+                    f"Operation completion {operation_finish} exceeds flow period {data_stream.period}"
                 )
             
             # Recrear el array de operaciones temporales con la actualizada
-            self.temp_operations = [(link, op)]
+            self.provisional_activities = [(network_connection, operation_record)]
             
             # Volver a verificar conflictos
-            offset = self._check_temp_operations()
-            max_iter -= 1
+            time_adjustment = self._check_temp_operations()
+            iteration_limit -= 1
             
             # Use default fixed conflict resolution strategy
-            # (previous conflict_strategy action dimension was removed)
-            # Apply a small minimum offset to ensure progress
-            if offset is not None and offset == 0:
-                offset = max(1, int(switch_gap * Net.SWITCH_GAP_MIN))
+            # (previous conflict_strategy command dimension was removed)
+            # Apply a small minimum time_adjustment to ensure progress
+            if time_adjustment is not None and time_adjustment == 0:
+                time_adjustment = max(1, int(inter_packet_spacing * Net.SWITCH_GAP_MIN))
 
-        if max_iter == 0 and offset is not None:
+        # Registrar métricas de resolución de conflictos
+        try:
+            from tools.complexity_metrics import get_metrics
+            metrics = get_metrics()
+            metrics.record_conflict_resolution(iterations_used)
+        except ImportError:
+            pass  # Métricas opcionales
+
+        if iteration_limit == 0 and time_adjustment is not None:
             raise SchedulingError(
-                ErrorType.PeriodExceed,
+                ErrorType.DEADLINE_VIOLATION,
                 "Failed to resolve conflict after 16 iterations"
             )
 
         #  ⛔  Ya no se generan ni reservan reglas GCL durante el scheduling.
 
         # ---------- REWARD SHAPING ----------
-        GB_PEN      = 0.05   # guard-band (sí la decide RL)
+        guard_penalty      = 0.01   # Reducir penalización por guard-band de 0.05 a 0.01
 
-        reward = 1.0
-        reward -= GB_PEN * (guard_time / flow.period)
+        performance_score = 0.5  # Recompensa base más moderada (era 1.0)
+        performance_score -= guard_penalty * (safety_interval / data_stream.period)
 
         # NUEVO: Añadir el ajuste de recompensa por selección inteligente de flujo
-        reward += flow_reward_adj
+        performance_score += selection_bonus
+        
+        # Añadir recompensa por completar un hop exitosamente
+        performance_score += 0.1  # Pequeña recompensa por progreso
+        
+        # NUEVO: Normalizar recompensa para evitar explosiones
+        performance_score = np.clip(performance_score, -2.0, 2.0)  # Limitar entre -2 y +2
 
     except SchedulingError as e:
-        # Un flujo no cabe en su período ─ cerramos el episodio,
-        #  pero entregando TODO lo que sí se ha programado hasta ahora.
-        self.logger.debug(f"Fallo: {e.msg} (flujo {self.current_flow_idx})")
-
-        partial_res = {lnk: ops.copy()          # copia superficial es suficiente
-                       for lnk, ops in self.links_operations.items()}
-
-        return self._get_observation(), -1, True, False, {
-            "success": False,                  # episodio fallido
-            "ScheduleRes": partial_res,        # ← planificación parcial
+        # Un flujo no cabe en su período ─ simplemente lo saltamos y continuamos
+        self.event_recorder.debug(f"Fallo: {e.error_message} (flujo {self.active_stream_id}) - SALTANDO")
+        
+        # Marcar el flujo actual como terminado (fallido) para continuar
+        programmed_flows = sum(1 for finished in self.stream_finished if finished)
+        remaining_flows = sum(1 for finished in self.stream_finished if not finished)
+        
+        self.event_recorder.info(f"Progreso parcial: {programmed_flows} flujos completados, {remaining_flows} pendientes")
+        self.event_recorder.info(f"❌ Saltando flujo {self.traffic_streams[self.active_stream_id].flow_id} por fallo de scheduling")
+        
+        # Marcar el flujo como terminado (fallido)
+        self.stream_finished[self.active_stream_id] = True
+        
+        # Aplicar penalización por flujo fallido ESCALADA según progreso
+        # En lugar de -100 fijo, penalizar proporcionalmente
+        completed_flows = sum(1 for finished in self.stream_finished if finished)
+        total_flows = len(self.stream_finished)
+        progress_ratio = (completed_flows - 1) / total_flows  # -1 porque acabamos de marcar uno como fallido
+        
+        # Penalización más suave: de -1 a -10 según cuántos flujos llevamos completados
+        performance_score = -1 - (9 * progress_ratio)
+        
+        # NUEVO: Aplicar normalización también a las penalizaciones
+        performance_score = np.clip(performance_score, -2.0, 2.0)
+        
+        # Limpiar actividades provisionales
+        self.provisional_activities.clear()
+        
+        # Verificar si el episodio está completo
+        episode_complete = all(self.stream_finished)
+        
+        # Retornar inmediatamente sin procesar el flujo fallido
+        metadata = {
+            "success": episode_complete,
+            "ScheduleRes": self.connection_activities.copy() if episode_complete else None,
+            "curriculum_level": self.difficulty_level,
+            "stream_count": len(self.traffic_streams),
+            "latency_us": {
+                "average": 0,
+                "delay_variance": 0,
+                "maximum": 0,
+                "samples": [],
+            },
+            "stream_choice": {
+                "active_stream_id": self.active_stream_id,
+                "available_candidates": getattr(self, 'active_nominees', []),
+                "selected_option": stream_choice,
+                "reward_adj": selection_bonus
+            }
         }
+        
+        return self._get_observation(), performance_score, episode_complete, False, metadata
 
     # ------------------------------------------------------------ #
     # 3. Avanzar progreso del flujo                                #
     # ------------------------------------------------------------ #
-    self.links_operations[link].append((flow, op))
-    self.temp_operations.clear()
+    self.connection_activities[network_connection].append((data_stream, operation_record))
+    self.provisional_activities.clear()
 
     # 🌐 Registrar sólo si es el *primer* hop del flujo
-    if hop_idx == 0:
-        self.last_packet_start = op_start_time
+    if segment_index == 0:
+        self.last_packet_start = operation_begin
 
     # ❷  Marcar el enlace como ocupado hasta que el paquete esté completamente recibido Y PROCESADO
     # Usar reception_time que ya incluye DELAY_PROP + DELAY_PROC_RX
-    self.link_busy_until[link] = op.reception_time  # En lugar de op.end_time + Net.DELAY_PROP
+    self.connection_free_time[network_connection] = operation_record.reception_time  # En lugar de operation_record.completion_instant + Net.DELAY_PROP
     # 🔒 Mantener la sección crítica ocupada hasta que el frame se recibe
-    self.global_queue_busy_until = op.reception_time
+    self.system_busy_time = operation_record.reception_time
 
-    if is_egress_from_switch:                 # ❷ liberar switch al terminar
+    if outbound_from_switch:                 # ❷ liberar switch al terminar
         # Mantener el puerto bloqueado también durante la guard-band escogida
         # para reflejar exactamente la reserva temporal del modelo matemático
-        self.switch_busy_until[sw_src] = op.end_time + guard_time
+        self.node_free_time[sw_src] = operation_record.completion_instant + safety_interval
 
-    self.flow_progress[self.current_flow_idx] += 1
+    self.stream_advancement[self.active_stream_id] += 1
 
 
     # ❸  El "reloj" global se redefine como el evento más temprano pendiente
-    next_events = [*self.link_busy_until.values(),
-                  *self.switch_busy_until.values()]
+    pending_activities = [*self.connection_free_time.values(),
+                  *self.node_free_time.values()]
     # Si no quedan eventos pendientes, mantenemos el reloj en lugar de "rebobinar" a 0
-    self.global_time = min(next_events, default=self.global_time)
+    self.simulation_clock = min(pending_activities, default=self.simulation_clock)
 
     # ¿Terminó este flujo?
-    if self.flow_progress[self.current_flow_idx] == len(flow.path):
-        self.flow_completed[self.current_flow_idx] = True
+    if self.stream_advancement[self.active_stream_id] == len(data_stream.path):
+        self.stream_finished[self.active_stream_id] = True
+        
+        # Registrar métricas del flujo completado
+        try:
+            from tools.complexity_metrics import get_metrics
+            metrics = get_metrics()
+            metrics.record_flow_processing(data_stream.flow_id, len(data_stream.path))
+        except ImportError:
+            pass  # Métricas opcionales
+            
         # ---------- verificación latencia extremo-a-extremo ----------
-        fst = self.flow_first_tx[self.current_flow_idx]
-        e2e_latency = op.reception_time - fst if fst is not None else 0
+        first_timestamp = self.initial_transmission[self.active_stream_id]
+        total_delay = operation_record.reception_time - first_timestamp if first_timestamp is not None else 0
         
         # NUEVO: Guardar latencia e2e para estadísticas globales
-        self._flow_latencies.append(e2e_latency)
+        self._flow_latencies.append(total_delay)
 
         # ➕ Registrar la muestra en el acumulador global
-        self._latency_samples.append(e2e_latency)
+        self._latency_samples.append(total_delay)
         
         # *Incluir* la propagación y el procesamiento de RX en el presupuesto
         # 💡 Tomar el peor‑caso acumulativo sobre la ruta completa
-        hops = len(flow.path)
-        e2e_budget = (flow.e2e_delay +                      # presupuesto nominal
-                      Net.DELAY_PROP   * hops +            # propagación
-                      Net.DELAY_PROC_RX * hops +           # procesado RX
-                      guard_time        * (hops - 1))      # guard‑band por hop
-        if e2e_latency > e2e_budget:
-            raise SchedulingError(ErrorType.PeriodExceed,
-                                  f"E2E delay {e2e_latency} > {e2e_budget}")
-        reward += 2
+        path_segments = len(data_stream.path)
+        end_to_end_allowance = (data_stream.e2e_delay +                      # presupuesto nominal
+                      Net.DELAY_PROP   * path_segments +            # propagación
+                      Net.DELAY_PROC_RX * path_segments +           # procesado RX
+                      safety_interval        * (path_segments - 1))      # guard‑band por hop
+        if total_delay > end_to_end_allowance:
+            raise SchedulingError(ErrorType.DEADLINE_VIOLATION,
+                                  f"E2E latency_offset {total_delay} > {end_to_end_allowance}")
+        performance_score += 2
 
     # ¿Terminó episodio?
-    done = all(self.flow_completed)
+    episode_complete = all(self.stream_finished)
     
     # Después de procesar un hop de un flujo, si el destino es un switch,
     # inmediatamente preparar el siguiente hop para transmisión
-    if not done and hop_idx < len(flow.path) - 1:
-        dst_node = link.link_id[1] if isinstance(link.link_id, tuple) else link.link_id.split('-')[1]
-        if dst_node.startswith('S') and not dst_node.startswith('SRV'):
+    if not episode_complete and segment_index < len(data_stream.path) - 1:
+        target_endpoint = network_connection.link_id[1] if isinstance(network_connection.link_id, tuple) else network_connection.link_id.split('-')[1]
+        if target_endpoint.startswith('S') and not target_endpoint.startswith('SRV'):
             # Este paquete llegó a un switch, marcar como alta prioridad
             # para ser procesado en el siguiente paso
-            arrival_time = op.reception_time
-            self.switch_last_arrival[dst_node] = min(arrival_time, self.switch_last_arrival[dst_node])
+            reception_instant = operation_record.reception_time
+            self.node_last_reception[target_endpoint] = min(reception_instant, self.node_last_reception[target_endpoint])
             
             # Actualizar el reloj global para favorecer el procesamiento inmediato
             # de este paquete que acaba de llegar al switch
-            if arrival_time < self.global_time:
-                next_events = [*self.link_busy_until.values(), *self.switch_busy_until.values(), arrival_time]
-                self.global_time = min(next_events)
+            if reception_instant < self.simulation_clock:
+                pending_activities = [*self.connection_free_time.values(), *self.node_free_time.values(), reception_instant]
+                self.simulation_clock = min(pending_activities)
 
     # Gestionar el curriculum learning
-    if done and all(self.flow_completed):
+    if episode_complete and all(self.stream_finished):
         # Episodio exitoso: incrementar contador de éxitos consecutivos
-        self.consecutive_successes += 1
+        self.streak_count += 1
         # Añadir bonificación de recompensa proporcional al nivel de complejidad
-        reward += 5.0 * self.current_complexity
+        # MODERADA la bonificación para evitar recompensas extremas
+        performance_score += min(2.0 * self.difficulty_level, 10.0)  # Máximo +10
+        
+        # NUEVO: Normalizar bonificación final también
+        performance_score = np.clip(performance_score, -2.0, 15.0)  # Permitir hasta +15 para éxito completo
 
         # ──────────────────────────────────────────────────────────────
         #  〽️  Calculamos las estadísticas de latencia del episodio
         # ──────────────────────────────────────────────────────────────
         if self._latency_samples:
-            avg_lat = sum(self._latency_samples) / len(self._latency_samples)
-            max_lat = max(self._latency_samples)
-            jitter  = _stat.pstdev(self._latency_samples) if len(self._latency_samples) > 1 else 0
-            self.logger.info(
-                f"⏱️  Latencia promedio={avg_lat:.1f} µs · "
-                f"jitter={jitter:.1f} µs · "
-                f"máxima={max_lat} µs"
+            mean_delay = sum(self._latency_samples) / len(self._latency_samples)
+            peak_delay = max(self._latency_samples)
+            delay_variance  = _stat.pstdev(self._latency_samples) if len(self._latency_samples) > 1 else 0
+            self.event_recorder.info(
+                f"⏱️  Latencia promedio={mean_delay:.1f} µs · "
+                f"delay_variance={delay_variance:.1f} µs · "
+                f"máxima={peak_delay} µs"
             )
         else:
-            avg_lat = max_lat = jitter = 0
+            mean_delay = peak_delay = delay_variance = 0
         
         # Mostrar información del progreso del curriculum
-        if self.curriculum_enabled:
-            self.logger.info(f"Éxito con {len(self.flows)}/{self.total_flows} flujos (complejidad: {self.current_complexity:.2f}, éxitos: {self.consecutive_successes}/3)")
+        if self.adaptive_learning:
+            self.event_recorder.info(f"Éxito con {len(self.traffic_streams)}/{self.complete_stream_count} flujos (complejidad: {self.difficulty_level:.2f}, éxitos: {self.streak_count}/3)")
     
-    info = {
-        "success": done,
-        "ScheduleRes": self.links_operations.copy() if done else None,
-        "curriculum_level": self.current_complexity,
-        "num_flows": len(self.flows),
+    metadata = {
+        "success": episode_complete,
+        "ScheduleRes": self.connection_activities.copy() if episode_complete else None,
+        "curriculum_level": self.difficulty_level,
+        "stream_count": len(self.traffic_streams),
 
         # ─── métricas de latencia E2E ───
         "latency_us": {
-            "average": avg_lat,
-            "jitter" : jitter,
-            "maximum": max_lat,
+            "average": mean_delay,
+            "delay_variance" : delay_variance,
+            "maximum": peak_delay,
             "samples": self._latency_samples.copy(),
         },
         # NUEVO: Añadir información sobre selección de flujos
-        "flow_selection": {
-            "current_flow_idx": self.current_flow_idx,
-            "available_candidates": getattr(self, 'current_candidate_flows', []),
-            "selected_option": flow_selection,
-            "reward_adj": flow_reward_adj
+        "stream_choice": {
+            "active_stream_id": self.active_stream_id,
+            "available_candidates": getattr(self, 'active_nominees', []),
+            "selected_option": stream_choice,
+            "reward_adj": selection_bonus
         }
     }
 
     # ────────────────────────────────────────────────────────────────
     #  Al terminar el episodio (todos los flujos entregados) → métricas
     # ────────────────────────────────────────────────────────────────
-    if done and self._flow_latencies:
-        avg_lat = sum(self._flow_latencies) / len(self._flow_latencies)
-        max_lat = max(self._flow_latencies)
+    if episode_complete and self._flow_latencies:
+        mean_delay = sum(self._flow_latencies) / len(self._flow_latencies)
+        peak_delay = max(self._flow_latencies)
         import statistics as _st
-        jitter = _st.pstdev(self._flow_latencies) if len(self._flow_latencies) > 1 else 0
+        delay_variance = _st.pstdev(self._flow_latencies) if len(self._flow_latencies) > 1 else 0
 
         # Log amigable
-        self.logger.info(
-            f"⏱️  Latencia promedio={avg_lat:.0f} µs · "
-            f"jitter={jitter:.0f} µs · máxima={max_lat:.0f} µs"
+        self.event_recorder.info(
+            f"⏱️  Latencia promedio={mean_delay:.0f} µs · "
+            f"delay_variance={delay_variance:.0f} µs · máxima={peak_delay:.0f} µs"
         )
 
-        # Añadir al diccionario `info`
-        info["latency_us"] = {
-            "average": avg_lat,
-            "jitter":  jitter,
-            "max":     max_lat,
+        # Añadir al diccionario `metadata`
+        metadata["latency_us"] = {
+            "average": mean_delay,
+            "delay_variance":  delay_variance,
+            "max":     peak_delay,
         }
 
-    return self._get_observation(), reward, done, False, info
+    return self._get_observation(), performance_score, episode_complete, False, metadata

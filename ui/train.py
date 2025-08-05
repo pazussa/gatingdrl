@@ -22,12 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Importar módulos desde rutas relativas
 from ui.test import test
 from tools.definitions import OUT_DIR, LOG_DIR  # Add LOG_DIR to import
-from core.learning.encoder import FeaturesExtractor
+from core.learning.encoder import AttributeProcessor
 # Importar MaskablePPO directamente
 from sb3_contrib import MaskablePPO
 from core.scheduler.scheduler import DrlScheduler
 from core.learning.environment import NetEnv # Eliminar TrainingNetEnv
-from tools.log_config import log_config
+import tools.log_config  # Importar el módulo completo para activar la función metadata
+from tools.log_config import log_config  # También importar la función específica
 from core.network.net import FlowGenerator, UniDirectionalFlowGenerator, generate_graph, Network
 from tools.definitions import OUT_DIR, LOG_DIR
 
@@ -60,33 +61,40 @@ def get_best_model_file(topo=TOPO, alg=DRL_ALG):
     return os.path.join(get_best_model_path(topo, alg), "best_model.zip")
 
 
-def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True, link_rate: int = 100, 
+def make_env(stream_count, rank: int, topo: str, monitor_dir, training: bool = True, link_rate: int = 100, 
              min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
-             use_curriculum: bool = True):
+             use_curriculum: bool = True, graph_mode_enabled: bool = None):
     def _init():
-        graph = generate_graph(topo, link_rate)
+        network_structure = generate_graph(topo, link_rate)
 
         # Simplificar - eliminar jitters
         # Cualquier variante "UNIDIR*" se trata como unidireccional
         is_unidir = topo.startswith("UNIDIR")
         # Pasar el rango de payload al generador
         if is_unidir:
-            flow_generator = UniDirectionalFlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
+            stream_factory = UniDirectionalFlowGenerator(network_structure, min_payload=min_payload, max_payload=max_payload)
         else:
-            flow_generator = FlowGenerator(graph, min_payload=min_payload, max_payload=max_payload)
+            stream_factory = FlowGenerator(network_structure, min_payload=min_payload, max_payload=max_payload)
 
         # Generar todos los flujos - asegurarse de crear exactamente el número solicitado
-        flows = flow_generator(num_flows)
-        logging.info(f"Generados {len(flows)} flujos para {topo} (solicitados: {num_flows})")
+        traffic_streams = stream_factory(stream_count)
+        logging.metadata(f"Generados {len(traffic_streams)} flujos para {topo} (solicitados: {stream_count})")
         
-        network = Network(graph, flows)
+        infrastructure = Network(network_structure, traffic_streams)
+        
+        # Determinar si usar observaciones de grafo si no se especifica
+        if graph_mode_enabled is None:
+            use_graph_obs = DRL_ALG in ["SAC", "MaskableSAC"]
+        else:
+            use_graph_obs = graph_mode_enabled
         
         # Crear entorno con curriculum learning adaptativo
         env = NetEnv(
-            network, 
-            curriculum_enabled=use_curriculum,  
-            initial_complexity=0.25 if use_curriculum else 1.0,  # Si no hay curriculum, usar 100% de complejidad
-            curriculum_step=0.05      # Incrementar 5% por cada éxito
+            infrastructure, 
+            adaptive_learning=use_curriculum,  
+            starting_difficulty=0.25 if use_curriculum else 1.0,  # Si no hay curriculum, usar 100% de complejidad
+            advancement_rate=0.05,      # Incrementar 5% por cada éxito
+            graph_mode_enabled=use_graph_obs
         )
 
         # Wrap the environment with Monitor
@@ -96,49 +104,73 @@ def make_env(num_flows, rank: int, topo: str, monitor_dir, training: bool = True
     return _init
 
 
-def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True, show_log: bool = True):
+def train(topo: str, num_time_steps, monitor_dir, stream_count=NUM_FLOWS, pre_trained_model=None, link_rate=100, min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD, use_curriculum: bool = True, show_log: bool = True):
     # ────────────────────────────────────────────────────────────────
     #  NUEVO: Limpiar completamente el directorio de salida
     # ────────────────────────────────────────────────────────────────
     if os.path.exists(OUT_DIR):
-        logging.info(f"Limpiando directorio de salida: {OUT_DIR}")
+        logging.metadata(f"Limpiando directorio de salida: {OUT_DIR}")
         shutil.rmtree(OUT_DIR)
     
     # Recrear el directorio vacío
     os.makedirs(OUT_DIR, exist_ok=True)
-    os.makedirs(LOG_DIR, exist_ok=True)  # También recreamos LOG_DIR
-
-    # Siempre usar todos los cores disponibles
+    os.makedirs(LOG_DIR, exist_ok=True)  # También recreamos LOG_DIR    # Siempre usar todos los cores disponibles
     n_envs = NUM_ENVS
-    logging.info(f"Usando {n_envs} entornos en paralelo (núcleos CPU detectados: {multiprocessing.cpu_count()})")
+    logging.metadata(f"Usando {n_envs} entornos en paralelo (núcleos CPU detectados: {multiprocessing.cpu_count()})")
+    
+    # Calcular n_steps por entorno según especificaciones LaTeX
+    steps_per_env = 2048 // n_envs
+    logging.metadata(f"Rollout: {2048} pasos totales = {steps_per_env} pasos por entorno × {n_envs} entornos")
     
     env = SubprocVecEnv([
         # Ya no hay distinción entre entornos de entrenamiento y evaluación,
-        # ambos usan la configuración completa de num_flows desde el principio
-        make_env(num_flows, i, topo, monitor_dir, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=use_curriculum)  # Pasar flag de curriculum
-        for i in range(n_envs)
-        ])
-
-    # FORZAR ENTRENAMIENTO DESDE CERO - No cargar modelo pre-entrenado por defecto
+        # ambos usan la configuración completa de stream_count desde el principio
+        make_env(stream_count, iterator, topo, monitor_dir, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=use_curriculum, graph_mode_enabled=DRL_ALG in ["SAC", "MaskableSAC"])  # Pasar flag de curriculum
+        for iterator in range(n_envs)
+        ])# FORZAR ENTRENAMIENTO DESDE CERO - No cargar modelo pre-entrenado por defecto
     if pre_trained_model is not None and os.path.exists(pre_trained_model):
-        logging.info(f"Cargando modelo pre-entrenado: {pre_trained_model}")
+        logging.metadata(f"Cargando modelo pre-entrenado: {pre_trained_model}")
         model = MaskablePPO.load(pre_trained_model, env)
     else:
         if pre_trained_model is not None:
             logging.warning(f"Modelo pre-entrenado especificado no existe: {pre_trained_model}")
         
-        logging.info("Iniciando entrenamiento DESDE CERO (sin modelo pre-entrenado)")
-        policy_kwargs = dict(
-            features_extractor_class=FeaturesExtractor,
-        )
-
+        logging.metadata("Iniciando entrenamiento DESDE CERO (sin modelo pre-entrenado)")
+        
+        # -------- seleccionar extractor automáticamente --------
+        from core.learning.hats_extractor import HATSExtractor
+        extractor_cls = HATSExtractor if DRL_ALG in ["SAC", "MaskableSAC"] else AttributeProcessor
+        policy_kwargs = dict(features_extractor_class=extractor_cls)
+        
+        # -------- Configuración explícita de hiperparámetros PPO (según especificaciones LaTeX) --------
+        ppo_hyperparams = {
+            "learning_rate": 1e-4,      # Reducir learning rate para mayor estabilidad (era 3e-4)
+            "n_steps": 2048 // n_envs,  # Pasos por entorno (2048 total dividido entre entornos)
+            "batch_size": 64,           # Tamaño de lote para optimización
+            "n_epochs": 10,             # Épocas de optimización por actualización
+            "gamma": 0.99,             # Factor de descuento (según LaTeX)
+            "gae_lambda": 0.95,         # Lambda para GAE (Generalized Advantage Estimation)
+            "clip_range": 0.1,          # Reducir clipping para mayor estabilidad (era 0.2)
+            "clip_range_vf": 0.1,       # Añadir clipping del value function para estabilidad
+            "ent_coef": 0.02,           # Aumentar entropía para más exploración (era 0.01)
+            "vf_coef": 0.5,             # Coeficiente del value function loss
+            "max_grad_norm": 0.3,       # Reducir clipping del gradiente (era 0.5)
+            "target_kl": 0.01,          # Añadir límite KL divergence para estabilidad
+        }
+        
         # Crear modelo completamente nuevo sin cargar ningún modelo previo
-        model = MaskablePPO("MlpPolicy", env, policy_kwargs=policy_kwargs, verbose=1)
+        model = MaskablePPO(
+            "MlpPolicy", 
+            env, 
+            policy_kwargs=policy_kwargs, 
+            verbose=1,
+            **ppo_hyperparams
+        )
 
     eval_env = SubprocVecEnv([
         # El entorno de evaluación también usa la misma configuración
-        make_env(num_flows, i, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False)
-        for i in range(n_envs)
+        make_env(stream_count, iterator, topo, monitor_dir, training=False, link_rate=link_rate, min_payload=min_payload, max_payload=max_payload, use_curriculum=False, graph_mode_enabled=DRL_ALG in ["SAC", "MaskableSAC"])
+        for iterator in range(n_envs)
         ])
     
     # Crear callback de evaluación y métricas
@@ -184,8 +216,8 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
             # FORZAR PARADA EXACTA cuando alcance el límite
             if current_timesteps >= self.max_timesteps:
                 if not self.logged_stop:
-                    logging.info(f"🛑 PARADA FORZADA: Alcanzado límite exacto de {self.max_timesteps} timesteps")
-                    logging.info(f"🔢 Timesteps del modelo: {current_timesteps}")
+                    logging.metadata(f"🛑 PARADA FORZADA: Alcanzado límite exacto de {self.max_timesteps} timesteps")
+                    logging.metadata(f"🔢 Timesteps del modelo: {current_timesteps}")
                     self.logged_stop = True
                 return False  # Detener inmediatamente
             
@@ -193,28 +225,28 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
             if len(self.locals.get('dones', [])) > 0 and any(self.locals['dones']):
                 self.episode_count += 1
                 
-                # Obtener reward promedio de los entornos activos
+                # Obtener performance_score promedio de los entornos activos
                 if 'infos' in self.locals:
                     episode_rewards = []
-                    for info in self.locals['infos']:
-                        if isinstance(info, dict) and 'episode' in info:
-                            episode_rewards.append(info['episode']['r'])
+                    for metadata in self.locals['infos']:
+                        if isinstance(metadata, dict) and 'episode' in metadata:
+                            episode_rewards.append(metadata['episode']['r'])
                     
                     if episode_rewards:
                         avg_reward = sum(episode_rewards) / len(episode_rewards)
-                        current_time = time.time()
+                        system_clock = time.time()
                         
                         # Guardar datos
                         self.convergence_data["rewards"].append(avg_reward)
                         self.convergence_data["episode_numbers"].append(self.episode_count)
-                        self.convergence_data["timestamps"].append(current_time)
+                        self.convergence_data["timestamps"].append(system_clock)
                         
                         # Verificar convergencia si tenemos suficientes datos
                         self._check_convergence()
                         
                         # Log de progreso cada 100 episodios
                         if self.episode_count % 100 == 0:
-                            logging.info(f"📊 Episodio {self.episode_count}, Timesteps: {current_timesteps}/{self.max_timesteps}, Reward promedio: {avg_reward:.3f}")
+                            logging.metadata(f"📊 Episodio {self.episode_count}, Timesteps: {current_timesteps}/{self.max_timesteps}, Reward promedio: {avg_reward:.3f}")
                         
             return True
             
@@ -233,6 +265,17 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
             # Verificar si tenemos suficientes datos para la ventana
             if len(data["rewards"]) < window_size:
                 return
+                
+            # NUEVO: Early stopping si las recompensas colapsan
+            recent_rewards = data["rewards"][-50:]  # Últimos 50 episodios
+            if len(recent_rewards) >= 50:
+                mean_recent = sum(recent_rewards) / len(recent_rewards)
+                if mean_recent < -50:  # Si el promedio es muy negativo
+                    logging.warning(f"🚨 EARLY STOPPING: Recompensas colapsando (promedio reciente: {mean_recent:.2f})")
+                    data["is_converged"] = True
+                    data["convergence_episode"] = data["episode_numbers"][-1]
+                    data["convergence_time"] = data["timestamps"][-1] - data["timestamps"][0]
+                    return
                 
             # Obtener los últimos rewards en la ventana
             recent_rewards = data["rewards"][-window_size:]
@@ -254,7 +297,7 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
                 data["convergence_episode"] = data["episode_numbers"][-1]
                 data["convergence_time"] = data["timestamps"][-1] - data["timestamps"][0]
                 
-                logging.info(
+                logging.metadata(
                     f"🎯 CONVERGENCIA DETECTADA en episodio {data['convergence_episode']} "
                     f"(Coef. Variación: {coefficient_of_variation:.4f} ≤ {threshold})"
                 )
@@ -274,8 +317,8 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
     # ══════════════════════════════════════════════════════════════════
     #  🎯 ENTRENAMIENTO CON CONTROL EXACTO DE TIMESTEPS - VERSIÓN CORREGIDA
     # ══════════════════════════════════════════════════════════════════
-    logging.info(f"Iniciando entrenamiento por EXACTAMENTE {num_time_steps} timesteps...")
-    logging.info(f"Usando {n_envs} entornos en paralelo")
+    logging.metadata(f"Iniciando entrenamiento por EXACTAMENTE {num_time_steps} timesteps...")
+    logging.metadata(f"Usando {n_envs} entornos en paralelo")
     
     # Crear un callback adicional más simple que solo controle timesteps
     class StrictTimestepCallback(BaseCallback):
@@ -287,7 +330,7 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
         def _on_step(self) -> bool:
             if self.model.num_timesteps >= self.max_timesteps:
                 if not self.logged:
-                    logging.info(f"🚨 PARADA ESTRICTA: {self.model.num_timesteps} timesteps alcanzados")
+                    logging.metadata(f"🚨 PARADA ESTRICTA: {self.model.num_timesteps} timesteps alcanzados")
                     self.logged = True
                 return False
             return True
@@ -313,12 +356,12 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
     # Verificar timesteps finales con mayor detalle
     actual_timesteps = model.num_timesteps
     
-    logging.info(f"✅ Entrenamiento completado")
-    logging.info(f"🎯 Timesteps solicitados: {num_time_steps}")
-    logging.info(f"📊 Timesteps ejecutados: {actual_timesteps}")
+    logging.metadata(f"✅ Entrenamiento completado")
+    logging.metadata(f"🎯 Timesteps solicitados: {num_time_steps}")
+    logging.metadata(f"📊 Timesteps ejecutados: {actual_timesteps}")
     
     if actual_timesteps == num_time_steps:
-        logging.info(f"🎯 PERFECTO: Timesteps exactos ejecutados")
+        logging.metadata(f"🎯 PERFECTO: Timesteps exactos ejecutados")
     elif actual_timesteps > num_time_steps:
         sobrepaso = actual_timesteps - num_time_steps
         sobrepaso_pct = (sobrepaso / num_time_steps) * 100
@@ -327,10 +370,10 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
         deficit = num_time_steps - actual_timesteps
         logging.warning(f"⚠️ DÉFICIT: {deficit} timesteps menos de lo esperado")
     
-    end_time = time.time()
-    total_training_time = end_time - start_time
+    completion_instant = time.time()
+    total_training_time = completion_instant - start_time
     
-    logging.info("Training complete.")
+    logging.metadata("Training complete.")
 
     # ══════════════════════════════════════════════════════════════════
     #  📊 ANÁLISIS Y REPORTE DE CONVERGENCIA
@@ -402,41 +445,66 @@ def train(topo: str, num_time_steps, monitor_dir, num_flows=NUM_FLOWS, pre_train
     
     # Log para archivo (siempre se escribe en el log)
     if convergence_data["is_converged"]:
-        logging.info(
+        logging.metadata(
             f"🎯 Convergencia: episodio {convergence_data['convergence_episode']} "
             f"({convergence_data['convergence_time']:.1f}s) de {total_episodes} episodios totales"
         )
     else:
-        logging.info(f"⚠️ Sin convergencia detectada en {total_episodes} episodios ({total_training_time:.1f}s)")
+        logging.metadata(f"⚠️ Sin convergencia detectada en {total_episodes} episodios ({total_training_time:.1f}s)")
+
+    # ══════════════════════════════════════════════════════════════════
+    #  📊 NUEVO: REPORTE DE MÉTRICAS DE COMPLEJIDAD COMPUTACIONAL
+    # ══════════════════════════════════════════════════════════════════
+    try:
+        from tools.complexity_metrics import get_metrics
+        metrics = get_metrics()
+        
+        if show_log:
+            complexity_report = metrics.generate_report()
+            print(complexity_report)
+        
+        # Siempre registrar en el log
+        metrics.log_summary()
+        
+        # Guardar reporte completo en archivo
+        complexity_report_path = os.path.join(OUT_DIR, "complexity_metrics.txt")
+        with open(complexity_report_path, 'w') as f:
+            f.write(metrics.generate_report())
+        logging.metadata(f"Reporte de métricas de complejidad guardado en: {complexity_report_path}")
+        
+    except ImportError:
+        if show_log:
+            print("⚠️ Métricas de complejidad no disponibles (tools.complexity_metrics no encontrado)")
+        logging.warning("Métricas de complejidad no disponibles")
 
     # NUEVO: Ejecutar un episodio final y guardar los detalles del scheduling
     if show_log:
-        logging.info("Ejecutando episodio final para generar informe detallado...")
+        logging.metadata("Ejecutando episodio final para generar informe detallado...")
         print("\n🔍 Ejecutando episodio final para validar el entrenamiento...")
     
-    obs = env.reset()
-    done = False
+    current_state = env.reset()
+    episode_complete = False
     final_info = None
     
     # Ejecutar un episodio completo con el modelo entrenado
-    while not done:
-        action_masks = np.vstack(env.env_method('action_masks'))
-        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks.astype(np.int8))
-        obs, _, dones, infos = env.step(action)
-        done = any(dones)
-        if done:
+    while not episode_complete:
+        permitted_actions = np.vstack(env.env_method('action_masks'))
+        command, _ = model.predict(current_state, deterministic=True, action_masks=permitted_actions.astype(np.int8))
+        current_state, _, dones, infos = env.step(command)
+        episode_complete = any(dones)
+        if episode_complete:
             # Buscar información de éxito en algún entorno
-            for i, is_done in enumerate(dones):
-                if is_done and infos[i].get('success'):
-                    final_info = infos[i]
+            for iterator, is_done in enumerate(dones):
+                if is_done and infos[iterator].get('success'):
+                    final_info = infos[iterator]
                     break
     
     # Mostrar resultado del episodio final si show_log está activado
     if final_info and final_info.get('ScheduleRes'):
         if show_log:
             print(f"✅ Episodio de validación exitoso: {len(final_info['ScheduleRes'])} enlaces programados")
-            print(f"📊 Flujos programados: {final_info.get('scheduled_flows', 0)}/{final_info.get('total_flows', num_flows)}")
-        logging.info(f"Scheduling final exitoso con {len(final_info['ScheduleRes'])} enlaces programados")
+            print(f"📊 Flujos programados: {final_info.get('scheduled_flows', 0)}/{final_info.get('complete_stream_count', stream_count)}")
+        logging.metadata(f"Scheduling final exitoso con {len(final_info['ScheduleRes'])} enlaces programados")
     elif show_log:
         print("⚠️ Episodio de validación no completó el scheduling exitosamente")
 
@@ -462,13 +530,13 @@ def plot_results(log_folder, title="Learning Curve"):
     :param title: (str) the title of the task to plot
     """
     try:
-        x, y = ts2xy(load_results(log_folder), "timesteps")
+        feature_tensor, y = ts2xy(load_results(log_folder), "timesteps")
         y = moving_average(y, window=50)
-        # Truncate x
-        x = x[len(x) - len(y):]
+        # Truncate feature_tensor
+        feature_tensor = feature_tensor[len(feature_tensor) - len(y):]
 
         fig = plt.figure(title)
-        plt.plot(x, y)
+        plt.plot(feature_tensor, y)
         plt.xlabel("Number of Timesteps")
         plt.ylabel("Rewards")
         plt.title(title + " Smoothed")
@@ -478,7 +546,7 @@ def plot_results(log_folder, title="Learning Curve"):
             max_reward = max(y)
             plt.ylim(0, max_reward * 1.05)  # Add 5% padding at the top
         
-        plt.savefig(os.path.join(log_folder, "reward.png"))
+        plt.savefig(os.path.join(log_folder, "performance_score.png"))
         
         # Use non-blocking display and catch any errors
         try:
@@ -487,10 +555,10 @@ def plot_results(log_folder, title="Learning Curve"):
             plt.close()
         except Exception as e:
             logging.warning(f"Could not display plot interactively: {e}")
-            logging.info("Plot saved to file, continuing without interactive display.")
+            logging.metadata("Plot saved to file, continuing without interactive display.")
     except Exception as e:
         logging.error(f"Error plotting results: {e}")
-        logging.info("Continuing without plotting.")
+        logging.metadata("Continuing without plotting.")
 
 
 def main():
@@ -500,9 +568,9 @@ def main():
     # specify an existing model to train.
     parser = argparse.ArgumentParser(conflict_handler="resolve")
     parser.add_argument('--time_steps', type=int, required=True)
-    parser.add_argument('--num_flows', type=int, nargs='?', default=NUM_FLOWS)
+    parser.add_argument('--stream_count', type=int, nargs='?', default=NUM_FLOWS)
     # Eliminar la opción de especificar num_envs, ahora es automático
-    parser.add_argument('--topo', type=str, default="SIMPLE", help="Topology type (e.g., SIMPLE, UNIDIR)")
+    parser.add_argument('--topo', type=str, default="SIMPLE", help="Topology type (e.network_graph., SIMPLE, UNIDIR)")
     parser.add_argument('--link_rate', type=int, default=100)
     # Añadir argumentos para min/max payload
     parser.add_argument('--min-payload', type=int, default=DEFAULT_MIN_PAYLOAD, help=f"Tamaño mínimo de payload en bytes (default: {DEFAULT_MIN_PAYLOAD})")
@@ -538,7 +606,7 @@ def main():
     if args.link_rate is not None:
         support_link_rates = [100, 1000]
         assert args.link_rate in support_link_rates, \
-            f"Unknown link rate {args.link_rate}, which is not in supported link rates {support_link_rates}"
+            f"Unknown network_connection rate {args.link_rate}, which is not in supported network_connection rates {support_link_rates}"
 
     # Validar rango de payload
     if args.min_payload > args.max_payload:
@@ -564,26 +632,26 @@ def main():
 
     log_config(os.path.join(OUT_DIR, f"train.log"), logging.DEBUG)
 
-    logging.info(args)
+    logging.metadata(args)
 
-    done = False
-    i = 0
+    episode_complete = False
+    iterator = 0
     MONITOR_DIR = None
-    while not done:
+    while not episode_complete:
         try:
-            MONITOR_DIR = os.path.join(MONITOR_ROOT_DIR, str(i))
+            MONITOR_DIR = os.path.join(MONITOR_ROOT_DIR, str(iterator))
             os.makedirs(MONITOR_DIR, exist_ok=False)
-            done = True
+            episode_complete = True
         except OSError:
-            i += 1
+            iterator += 1
             continue
     assert MONITOR_DIR is not None
 
-    logging.info("start training...")
+    logging.metadata("start training...")
     # Pasar show_log al método train
     train(args.topo, args.time_steps,
           MONITOR_DIR,  # Pasar MONITOR_DIR como parámetro
-          num_flows=args.num_flows,
+          stream_count=args.stream_count,
           pre_trained_model=args.model,  # Usar args.model (que podría ser None)
           link_rate=args.link_rate,
           min_payload=args.min_payload, # Pasar min/max payload
@@ -596,15 +664,15 @@ def main():
         plot_results(MONITOR_DIR)
     except Exception as e:
         logging.error(f"Error during plotting: {e}")
-        logging.info("Continuing without plotting.")
+        logging.metadata("Continuing without plotting.")
 
     # Remove metrics summary code
-    logging.info(f"Training completed successfully.")
+    logging.metadata(f"Training completed successfully.")
 
     # Al terminar training, invocamos test con los mismos args
     test(
         args.topo,
-        args.num_flows,
+        args.stream_count,
         NUM_ENVS,
         alg=DRL_ALG,
         link_rate=args.link_rate,

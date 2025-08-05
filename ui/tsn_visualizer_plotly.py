@@ -42,62 +42,62 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     legend_shown = set()
     
     # Extraer y procesar datos
-    for link, operations in schedule_res.items():
-        link_str = str(link)
+    for network_connection, operations in schedule_res.items():
+        link_str = str(network_connection)
         match = re.search(r"Link\('([^']+)', '([^']+)'\)", link_str)
         if not match:
             print(f"Error: No se pudo extraer origen/destino de {link_str}")
             continue
         
-        src, dst = match.group(1), match.group(2)
-        link_name = f"{src} → {dst}"
+        source_node, destination_node = match.group(1), match.group(2)
+        link_name = f"{source_node} → {destination_node}"
         
-        flow_ids = [flow.flow_id for flow, _ in operations]
+        flow_ids = [data_stream.flow_id for data_stream, _ in operations]
         print(f"Enlace: {link_name}, Flujos: {flow_ids}")
         
-        for flow, operation in operations:
-            all_flow_ids.add(flow.flow_id)
-            all_periods.add(flow.period)
+        for data_stream, operation in operations:
+            all_flow_ids.add(data_stream.flow_id)
+            all_periods.add(data_stream.period)
             
             # Calculate earliest_time on the fly based on the current Operation structure
             earliest_time = operation.start_time if operation.gating_time is None else operation.gating_time
             
             # Guardamos también el guard-band y el desglose de esperas
             link_data[link_name].append({
-                'flow_id'        : flow.flow_id,
-                'period'         : flow.period,
+                'flow_id'        : data_stream.flow_id,
+                'period'         : data_stream.period,
                 'start_time'     : operation.start_time,
                 'earliest_time'  : earliest_time,          # calculado
                 'gating_time'    : operation.gating_time,
                 'latest_time'    : operation.latest_time,
-                'end_time'       : operation.end_time,
+                'completion_instant'       : operation.completion_instant,
                 'reception_time' : operation.reception_time,
                 # ➊ NUEVOS campos → visualización de bloques temporales
-                'guard_time'     : getattr(operation, 'guard_time', 0),
+                'safety_interval'     : getattr(operation, 'safety_interval', 0),
                 'wait_breakdown' : operation.wait_breakdown,
                 'min_gap_wait'   : getattr(operation, 'min_gap_wait', 0),
                 # ---- acción RL (se mantiene) ----
                 'offset_idx'     : getattr(operation, 'offset_idx', None),
-                'offset_us'      : getattr(operation, 'offset_us',  None),
+                'timing_offset'      : getattr(operation, 'timing_offset',  None),
             })
             
-            max_end_time = max(max_end_time, operation.end_time)
+            max_end_time = max(max_end_time, operation.completion_instant)
             
             # ACTUALIZADO: Extraer ocupación del switch si este enlace sale de un switch
-            if src.startswith('S') and not src.startswith('SRV'):
+            if source_node.startswith('S') and not source_node.startswith('SRV'):
                 # El puerto del switch está ocupado durante la transmisión SOLAMENTE
                 # El switch termina de estar ocupado cuando el paquete sale completamente
                 switch_busy_start = earliest_time
                 # Mostrar la ocupación real del puerto: transmisión + guard-band
-                guard_time = link.interference_time() if hasattr(link, "interference_time") else 1.22
-                switch_busy_end = operation.end_time + guard_time
+                safety_interval = network_connection.interference_time() if hasattr(network_connection, "interference_time") else 1.22
+                switch_busy_end = operation.completion_instant + safety_interval
                 
                 # Almacenar período de ocupación para el switch
-                switch_busy_periods[src].append({
-                    'flow_id': flow.flow_id,
+                switch_busy_periods[source_node].append({
+                    'flow_id': data_stream.flow_id,
                     'start': switch_busy_start,
                     'end': switch_busy_end,  # El switch termina su trabajo cuando completa la transmisión
-                    'period': flow.period
+                    'period': data_stream.period
                 })
 
 
@@ -110,23 +110,23 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
 
     # ▸ valor máximo de Δsw  →  nos permite ampliar el eje-X hacia la izquierda
     global_max_gap = max(
-        (op['min_gap_wait'] for link_ops in link_data.values() for op in link_ops),
+        (operation_record['min_gap_wait'] for link_ops in link_data.values() for operation_record in link_ops),
         default=0
     )
     
     # Ordenar enlaces para visualización
-    # Considera como "switch-link" todo enlace cuyo **origen** sea S<n>
+    # Considera como "switch-network_connection" todo enlace cuyo **origen** sea S<n>
     switch_links = [lnk for lnk in link_data.keys() if re.match(r'^S\d+\s+→', lnk)]
     client_links = [lnk for lnk in link_data.keys() if lnk not in switch_links]
     sorted_links = sorted(switch_links) + sorted(client_links)
     
-    # --- TODOS los hops de switch van con gate ⇒ un solo esquema de colores ---
+    # --- TODOS los path_segments de switch van con gate ⇒ un solo esquema de colores ---
     # IMPORTANTE: Definir flow_colors ANTES de cualquier referencia
     flow_colors = {}
-    for i, flow_id in enumerate(sorted(all_flow_ids)):
-        hue = (i * 0.618033988749895) % 1
-        r, g, b = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
-        flow_colors[flow_id] = f'rgb({int(r*255)},{int(g*255)},{int(b*255)})'
+    for iterator, flow_id in enumerate(sorted(all_flow_ids)):
+        hue = (iterator * 0.618033988749895) % 1
+        r, network_graph, b = colorsys.hsv_to_rgb(hue, 0.7, 0.9)
+        flow_colors[flow_id] = f'rgb({int(r*255)},{int(network_graph*255)},{int(b*255)})'
     
     # ----- NUEVO: Añadir switches a la lista de elementos a visualizar -----
     # Ordenar switches para mostrarlos primero
@@ -143,7 +143,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     )
     
     # -- NUEVO: SECCIÓN 1: OCUPACIÓN DE SWITCHES --
-    for i, switch_name in enumerate(sorted_switches):
+    for iterator, switch_name in enumerate(sorted_switches):
         periods = switch_busy_periods[switch_name]
         
         # Replicar períodos para todo el hiperperíodo
@@ -155,8 +155,8 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             for rep in range(repetitions):
                 time_offset = rep * flow_period
                 start_time = period_info['start'] + time_offset
-                end_time = period_info['end'] + time_offset
-                duration = end_time - start_time
+                completion_instant = period_info['end'] + time_offset
+                duration = completion_instant - start_time
                 
                 # Añadir barra para el período ocupado
                 fig.add_trace(
@@ -169,14 +169,14 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                         marker=dict(
                             color='rgba(150,150,150,0.7)',
                             pattern=dict(
-                                shape="x",
+                                shape="/",
                                 solidity=0.3,
                                 fgcolor="black"
                             )
                         ),
                         showlegend=False,
                         hoverinfo='text',
-                        hovertext=f"Switch: {switch_name}<br>Ocupado por flujo: {flow_id}<br>Inicio: {start_time}µs<br>Fin: {end_time}µs",
+                        hovertext=f"Switch: {switch_name}<br>Ocupado por flujo: {flow_id}<br>Inicio: {start_time}µs<br>Fin: {completion_instant}µs",
                     ),
                     row=1, col=1
                 )
@@ -184,16 +184,16 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
     # -- SECCIÓN 2: GRÁFICO PRINCIPAL DE BARRAS (ahora en la segunda fila) --
     # Recopilar eventos de GCL
     gcl_events = []
-    for link, operations in schedule_res.items():
-        link_str = str(link)
+    for network_connection, operations in schedule_res.items():
+        link_str = str(network_connection)
         match = re.search(r"Link\('([^']+)', '([^']+)'\)", link_str)
         if not match:
             continue
-        src, dst = match.group(1), match.group(2)
-        link_name = f"{src} → {dst}"
+        source_node, destination_node = match.group(1), match.group(2)
+        link_name = f"{source_node} → {destination_node}"
         
         # Solo procesar enlaces que salen de un switch
-        if not src.startswith('S'):
+        if not source_node.startswith('S'):
             continue
         
         # Tratar todos los flujos como críticos para un GCL periódico
@@ -202,7 +202,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             print(f"Generando GCL periódico para enlace switch: {link_name}")
             
             # Calcular el hiperperíodo para todos los flujos
-            periods = [flow.period for flow, _ in link_operations]
+            periods = [data_stream.period for data_stream, _ in link_operations]
             hyperperiod_link = 1
             for period in periods:
                 hyperperiod_link = math.lcm(hyperperiod_link, period)
@@ -215,17 +215,17 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
 
             # 1) Ordenar operaciones por inicio real de transmisión
             ops_sorted = sorted(link_operations,
-                                key=lambda p: (p[1].gating_time or p[1].start_time))
+                                key=lambda probability: (probability[1].gating_time or probability[1].start_time))
             n = len(ops_sorted)
 
             if n < 2:
                 continue
 
             # 2) Hiperperíodo individual del enlace
-            periods = [flow.period for flow, _ in ops_sorted]
+            periods = [data_stream.period for data_stream, _ in ops_sorted]
             hyperperiod_link = 1
-            for p in periods:
-                hyperperiod_link = math.lcm(hyperperiod_link, p)
+            for probability in periods:
+                hyperperiod_link = math.lcm(hyperperiod_link, probability)
 
             # Variable para el umbral de gap (usado para filtrar qué eventos mostrar)
             gap_thr_us = 50  # umbral de espacio mínimo para crear entradas GCL
@@ -235,29 +235,29 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             all_reception_times = []
             
             # Recopilar todos los tiempos de transmisión y recepción
-            for i in range(n):
-                f_curr, op_curr = ops_sorted[i]
+            for iterator in range(n):
+                f_curr, op_curr = ops_sorted[iterator]
                 tx_start = op_curr.gating_time if op_curr.gating_time is not None else op_curr.start_time
                 # Para cada paquete, repetirlo durante todo el hiperperíodo
                 repetitions = hyperperiod_link // f_curr.period
                 for rep in range(repetitions):
-                    offset = rep * f_curr.period
+                    time_adjustment = rep * f_curr.period
                     # Guardar tiempo de inicio y recepción (normalizado al hiperperíodo)
-                    tx_t = (tx_start + offset) % hyperperiod_link
-                    rx_t = (op_curr.reception_time + offset) % hyperperiod_link
+                    tx_t = (tx_start + time_adjustment) % hyperperiod_link
+                    rx_t = (op_curr.reception_time + time_adjustment) % hyperperiod_link
                     all_transmission_times.append((tx_t, f_curr.flow_id))
                     all_reception_times.append((rx_t, f_curr.flow_id))
             
             # Ordenar los tiempos
-            all_transmission_times.sort(key=lambda x: x[0])
-            all_reception_times.sort(key=lambda x: x[0])
+            all_transmission_times.sort(key=lambda item: item[0])
+            all_reception_times.sort(key=lambda item: item[0])
             
             # PASO 2: Generar eventos GCL analizando los gaps significativos
             gcl_close_events = []  # Lista temporal para eventos de cierre (0)
             
             # Buscar gaps significativos entre recepción y siguiente transmisión
-            for i in range(len(all_reception_times)):
-                rx_time, rx_flow = all_reception_times[i]
+            for iterator in range(len(all_reception_times)):
+                rx_time, rx_flow = all_reception_times[iterator]
                 
                 # Encontrar el siguiente tiempo de transmisión después de esta recepción
                 next_tx_time = None
@@ -293,21 +293,21 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                 repetitions = hyperperiod_link // hyperperiod_link  # Simplificado a 1
                 
                 for rep in range(repetitions):
-                    offset = rep * hyperperiod_link
+                    time_adjustment = rep * hyperperiod_link
                     
                     # Añadir evento de cierre (0) en el tiempo de recepción
-                    close_t = (close_time + offset) % hyperperiod_link
+                    close_t = (close_time + time_adjustment) % hyperperiod_link
                     gcl_events.append((close_t, 0, close_flow, link_name, True))
                     
                     # Añadir evento de apertura (1) EXACTAMENTE cuando empieza el siguiente paquete
-                    open_t = (next_tx_time + offset) % hyperperiod_link
+                    open_t = (next_tx_time + time_adjustment) % hyperperiod_link
                     gcl_events.append((open_t, 1, next_tx_flow, link_name, True))
 
     # Ordenar eventos por tiempo
-    gcl_events.sort(key=lambda x: x[0])
+    gcl_events.sort(key=lambda item: item[0])
     
     # Para barras muy estrechas o marcadores de ventana de transmisión, mejorar visibilidad
-    for i, link_name in enumerate(sorted_links):
+    for iterator, link_name in enumerate(sorted_links):
         if (link_name not in link_data):
             continue
             
@@ -321,17 +321,17 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             for rep in range(repetitions):
                 # Calcular tiempos con el desplazamiento del período
                 time_offset = rep * flow_period
-                # Usar los tiempos recalculados si hubo offset
+                # Usar los tiempos recalculados si hubo time_adjustment
                 start_time = op_data['start_time'] + time_offset
-                end_time = op_data['end_time'] + time_offset
+                completion_instant = op_data['completion_instant'] + time_offset
                 earliest_time = op_data['earliest_time'] + time_offset  # Use the computed value
                 latest_time = op_data['latest_time'] + time_offset
                 gating_time = op_data['gating_time'] + time_offset if op_data['gating_time'] is not None else None
                 reception_time = op_data['reception_time'] + time_offset if op_data['reception_time'] is not None else None
 
-                # Tiempo de transmisión real (desde gating_time o start_time si no hay gating)
+                # Tiempo de transmisión real (desde gating_time o start_time si no hay time_synchronization)
                 actual_start_time = gating_time if gating_time is not None else start_time
-                transmission_duration = end_time - actual_start_time
+                transmission_duration = completion_instant - actual_start_time
 
                 # --- NUEVO: Barra de Tiempo de Espera con distinción de tipos ---
                 if gating_time is not None and gating_time > start_time:
@@ -414,7 +414,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                 #  BLOQUE 2 · ESPERA EN EL SWITCH  (Δsw y resto de waits)
                 # ---------------------------------------------------------------
                 wb = op_data['wait_breakdown']
-                # ▶️  dibujamos SIEMPRE que exista min_gap_wait, con o sin gating
+                # ▶️  dibujamos SIEMPRE que exista min_gap_wait, con o sin time_synchronization
                 if op_data['min_gap_wait'] > 0 and not wb:
                     # reconstruir diccionario vacío
                     wb = {'min_gap': op_data['min_gap_wait'],
@@ -475,8 +475,8 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                 # ---------------------------------------------------------------
                 #  BLOQUE 3 · GUARD-BAND  (γe·dmax)
                 # ---------------------------------------------------------------
-                guard_time = op_data['guard_time']
-                if guard_time > 0:
+                safety_interval = op_data['safety_interval']
+                if safety_interval > 0:
                     # Check if guard-band legend has been shown before
                     show_guard_legend = "guard_band" not in legend_shown
                     if show_guard_legend:
@@ -484,10 +484,10 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                         
                     fig.add_trace(
                         go.Bar(
-                            x=[guard_time],
+                            x=[safety_interval],
                             y=[link_name],
                             orientation='h',
-                            base=[end_time],
+                            base=[completion_instant],
                             name="Guard-band",
                             legendgroup="guard_band",
                             marker=dict(
@@ -496,7 +496,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                             ),
                             showlegend=show_guard_legend,
                             hoverinfo='text',
-                            hovertext=f"Guard-band: {guard_time} µs<br>Flujo: {flow_id}",
+                            hovertext=f"Guard-band: {safety_interval} µs<br>Flujo: {flow_id}",
                         ),
                         row=2, col=1
                     )
@@ -522,7 +522,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                             f"Flujo: {flow_id}"
                             f"<br>Período: {flow_period}µs"
                             f"<br>Inicio Tx: {actual_start_time}µs"
-                            f"<br>Fin Tx: {end_time}µs"
+                            f"<br>Fin Tx: {completion_instant}µs"
                             f"<br>Recibido: {reception_time}µs"
                         ),
                         showlegend=False,                # ← leyenda desactivada
@@ -531,17 +531,17 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                 )
 
                 # Obtener detalles de las decisiones del agente si están disponibles
-                guard_factor = getattr(operation, 'guard_factor', 1.0)
+                protection_multiplier = getattr(operation, 'protection_multiplier', 1.0)
                 min_gap = getattr(operation, 'min_gap_value', 1.0)
                 
                 # Tooltip completo con parámetros de RL
                 hover_text = (
-                    f"Flujo: {flow.flow_id}"
-                    f"<br>Período: {flow.period}µs"
+                    f"Flujo: {data_stream.flow_id}"
+                    f"<br>Período: {data_stream.period}µs"
                     f"<br>Inicio Tx: {actual_start_time}µs"
-                    f"<br>Fin Tx: {end_time}µs"
+                    f"<br>Fin Tx: {completion_instant}µs"
                     f"<br>Recibido: {reception_time}µs"
-                    f"<br>Guard Factor: {guard_factor:.2f}"
+                    f"<br>Guard Factor: {protection_multiplier:.2f}"
                     f"<br>Separación Mín: {min_gap:.1f}µs"
                 )
 
@@ -561,7 +561,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                     row=2, col=1
                 )
 
-                # Marcador para gating_time (cuándo empezó realmente si hubo gating)
+                # Marcador para gating_time (cuándo empezó realmente si hubo time_synchronization)
                 if gating_time is not None:
                     fig.add_trace(
                         go.Scatter(
@@ -577,8 +577,8 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                         row=2, col=1
                     )
 
-                # Marcador para latest_time (límite ventana gating)
-                # Solo relevante si hay gating
+                # Marcador para latest_time (límite ventana time_synchronization)
+                # Solo relevante si hay time_synchronization
                 if gating_time is not None:
                     fig.add_trace(
                         go.Scatter(
@@ -595,13 +595,13 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
                     )
     
     # -- SECCIÓN 3 (GCL): una fila por switch --------------------------------
-    #  ① Agrupamos los eventos por switch   →  gcl_by_switch[src] = [...]
+    #  ① Agrupamos los eventos por switch   →  gcl_by_switch[source_node] = [...]
     #  ② Para cada switch añadimos *dos* trazas (línea punteada + markers)
 
     # gcl_events se genera más arriba; aquí lo re-estructuramos:
     gcl_by_switch = defaultdict(list)
     for t, state, flow_id, link_name, is_gating in gcl_events:
-        # el nombre de la fila será, p.ej.,  "GCL S1"
+        # el nombre de la fila será, probability.ej.,  "GCL S1"
         src_sw = link_name.split(' ')[0]          # 'S1' de "S1 → SRV1"
         gcl_by_switch[src_sw].append((t, state, flow_id, is_gating))
 
@@ -609,7 +609,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
         print(f"Dibujando GCL para {len(gcl_by_switch)} switches")
         # Aseguramos orden estable
         for sw_name in sorted(gcl_by_switch.keys()):
-            events = sorted(gcl_by_switch[sw_name], key=lambda x: x[0])
+            events = sorted(gcl_by_switch[sw_name], key=lambda item: item[0])
             if not events:
                 continue
 
@@ -619,8 +619,8 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             colors  = ['rgba(0,0,255,0.9)' if s == 0 else 'rgba(0,180,0,0.9)'
                        for s in states]
             htexts  = [("Cierre" if s == 0 else "Apertura") +
-                       f"<br>{sw_name}<br>t={t}µs<br>Flujo={f}"
-                       for (t, s, f, _) in events]
+                       f"<br>{sw_name}<br>t={t}µs<br>Flujo={flow_generator}"
+                       for (t, s, flow_generator, _) in events]
 
             # Línea guía (gris) para esa fila
             fig.add_trace(
@@ -800,7 +800,7 @@ def visualize_tsn_schedule_plotly(schedule_res: ScheduleRes, save_path=None):
             name="Switch Ocupado",
             marker=dict(
                 color='rgba(150,150,150,0.7)',
-                pattern=dict(shape="x", solidity=0.3, fgcolor="black")
+                pattern=dict(shape="/", solidity=0.3, fgcolor="black")
             ),
             showlegend=True
         )

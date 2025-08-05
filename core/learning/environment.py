@@ -33,125 +33,127 @@ class NetEnv(gym.Env):
     @dataclass
     class GclInfo:
         gcl_cycle: int = 1
-        gcl_length: int = 0
-
-    # --------------------------------------------------------------------- #
+        gcl_length: int = 0    # --------------------------------------------------------------------- #
     #  Inicialización                                                       #
     # --------------------------------------------------------------------- #
-    def __init__(self, network: Optional[Network] = None, 
-                curriculum_enabled: bool = True,
-                initial_complexity: float = 0.25,
-                curriculum_step: float = 0.05) -> None:
+    def __init__(self, infrastructure: Optional[Network] = None, 
+                adaptive_learning: bool = True,
+                starting_difficulty: float = 0.25,
+                advancement_rate: float = 0.05,
+                graph_mode_enabled: bool = False) -> None:
         super().__init__()
 
         # --- Curriculum Learning Adaptativo ---
-        self.curriculum_enabled = curriculum_enabled
-        self.initial_complexity = initial_complexity 
-        self.curriculum_step = curriculum_step
-        self.current_complexity = initial_complexity
-        self.consecutive_successes = 0
-        self.original_flows = []  # Store the original complete set of flows
+        self.adaptive_learning = adaptive_learning
+        self.starting_difficulty = starting_difficulty 
+        self.advancement_rate = advancement_rate
+        self.difficulty_level = starting_difficulty
+        self.streak_count = 0
+        self.complete_stream_set = []  # Store the original complete set of traffic_streams
+        
+        # --- Graph observation support ---
+        self.graph_mode_enabled = graph_mode_enabled
         
         # Si se proporciona una red, guardar su estructura original
-        if network is not None:
-            self.total_flows = len(network.flows)
-            self.base_graph = network.graph
+        if infrastructure is not None:
+            self.complete_stream_count = len(infrastructure.traffic_streams)
+            self.network_topology = infrastructure.network_structure
             # Guardar todos los flujos originales
-            self.original_flows = list(network.flows)
+            self.complete_stream_set = list(infrastructure.traffic_streams)
             
             # Registro explícito para depuración del modo curriculum
-            self.logger = logging.getLogger(f"{__name__}.{os.getpid()}")
-            self.logger.setLevel(logging.INFO)
-            self.logger.info(f"Inicializando entorno con {self.total_flows} flujos (curriculum: {curriculum_enabled}, complejidad inicial: {initial_complexity})")
+            self.event_recorder = logging.getLogger(f"{__name__}.{os.getpid()}")
+            self.event_recorder.setLevel(logging.INFO)
+            self.event_recorder.info(f"Inicializando entorno con {self.complete_stream_count} flujos (curriculum: {adaptive_learning}, complejidad inicial: {starting_difficulty})")
             
-            if curriculum_enabled and initial_complexity < 1.0:
+            if adaptive_learning and starting_difficulty < 1.0:
                 # En modo curriculum, reducir el número inicial de flujos
-                active_flows = int(self.total_flows * self.initial_complexity)
-                active_flows = max(5, active_flows)  # Mínimo 5 flujos para empezar
+                enabled_streams = int(self.complete_stream_count * self.starting_difficulty)
+                enabled_streams = max(5, enabled_streams)  # Mínimo 5 flujos para empezar
                 
                 # Seleccionar subset de flujos para el nivel de complejidad actual
-                active_flows_list = self.original_flows[:active_flows]
-                network = Network(network.graph, active_flows_list)
-                self.logger.info(f"Modo curriculum ACTIVADO: usando {active_flows}/{self.total_flows} flujos inicialmente")
+                stream_collection = self.complete_stream_set[:enabled_streams]
+                infrastructure = Network(infrastructure.network_structure, stream_collection)
+                self.event_recorder.info(f"Modo curriculum ACTIVADO: usando {enabled_streams}/{self.complete_stream_count} flujos inicialmente")
             else:
                 # Si curriculum está desactivado o complejidad es 1.0, usar todos los flujos
-                self.logger.info(f"Modo curriculum DESACTIVADO: usando todos los {self.total_flows} flujos")
-                self.current_complexity = 1.0  # Forzar complejidad completa
+                self.event_recorder.info(f"Modo curriculum DESACTIVADO: usando todos los {self.complete_stream_count} flujos")
+                self.difficulty_level = 1.0  # Forzar complejidad completa
         
         # Si no se entrega una red, construir topología y flujos sencillos
-        if network is None:
-            g = generate_simple_topology()
-            f = generate_flows(g, 10)
-            network = Network(g, f)
-            self.total_flows = len(network.flows)
-            self.base_graph = g
+        if infrastructure is None:
+            network_graph = generate_simple_topology()
+            flow_generator = generate_flows(network_graph, 10)
+            infrastructure = Network(network_graph, flow_generator)
+            self.complete_stream_count = len(infrastructure.traffic_streams)
+            self.network_topology = network_graph
             # Crear generador de flujos apropiado
-            self.flow_generator = FlowGenerator(g)
+            self.stream_factory = FlowGenerator(network_graph)
 
         # --- Estructuras base -------------------------------------------- #
-        self.graph = network.graph
-        self.flows = list(network.flows)               # lista estable
-        self.line_graph, self.link_dict = (
-            network.line_graph,
-            network.links_dict,
+        self.network_structure = infrastructure.network_structure
+        self.traffic_streams = list(infrastructure.traffic_streams)               # lista estable
+        self.line_graph, self.connection_registry = (
+            infrastructure.line_graph,
+            infrastructure.links_dict,
         )
 
         # --- Estados internos ------------------------------------------- #
-        self.num_flows: int = len(self.flows)
+        self.stream_count: int = len(self.traffic_streams)
         # Reloj de referencia global (solo para la observación)
         # Se calcula siempre como el próximo evento más cercano
-        self.global_time: int = 0
-        self.flow_progress: List[int] = [0] * self.num_flows  # hop en curso de cada flujo
-        self.flow_completed: List[bool] = [False] * self.num_flows
-        self.flow_first_tx: List[int | None] = [None] * self.num_flows
-        self.current_flow_idx: int = 0                 # para round‑robin
+        self.simulation_clock: int = 0
+        self.stream_advancement: List[int] = [0] * self.stream_count  # hop en curso de cada flujo
+        self.stream_finished: List[bool] = [False] * self.stream_count
+        self.initial_transmission: List[int | None] = [None] * self.stream_count
+        self.active_stream_id: int = 0                 # para round‑robin
 
-        self.links_operations = defaultdict(list)
+        self.connection_activities = defaultdict(list)
 
         #  🔀  Las estructuras ligadas a GCL ya no se utilizan.  Mantener
         #  únicamente la planificación de operaciones; el cálculo de las
         #  tablas se traslada al *ResAnalyzer*.
 
-        self.temp_operations: List[tuple] = []         # op en construcción
+        self.provisional_activities: List[tuple] = []         # operation_record en construcción
 
         # 🔹 Placeholder para mantener compatibilidad con código heredado.
         #   Ya no se llena ni se usa, pero evita AttributeError.
-        self.links_gcl: dict = {}
+        self.connection_schedules: dict = {}
 
         # ⏱️  NUEVO: reloj "ocupado‑hasta" por enlace
         #    (cuándo queda libre cada enlace)
-        self.link_busy_until = defaultdict(int)
+        self.connection_free_time = defaultdict(int)
         # ⏱️⏱️ reloj "ocupado‑hasta" por switch **sólo para EGRESOS**
-        self.switch_busy_until = defaultdict(int)
+        self.node_free_time = defaultdict(int)
         
         # 📊 NUEVO: Registro del último tiempo de llegada por switch
         # Para garantizar separación mínima entre paquetes
-        self.switch_last_arrival = defaultdict(int)
+        self.node_last_reception = defaultdict(int)
 
         # ⏲️  Último instante en que **se creó** (primer hop) un paquete
         #     – solo se usa para imponer la separación en el PRIMER enlace
         self.last_packet_start = -Net.PACKET_GAP_EXTRA
 
         # 🚦 NUEVO: sección crítica global – "una sola cola"
-        self.global_queue_busy_until = 0
+        self.system_busy_time = 0
 
         # --- Espacios de observación y acción --------------------------- #
         self._setup_spaces()
 
         # --- Logger ------------------------------------------------------ #
-        self.logger = logging.getLogger(f"{__name__}.{os.getpid()}")
-        self.logger.setLevel(logging.INFO)
+        self.event_recorder = logging.getLogger(f"{__name__}.{os.getpid()}")
+        self.event_recorder.setLevel(logging.INFO)
 
         # Cache: «¿es nodo final?»
         self._es_node_cache: Dict[Any, bool] = {}
         
         # Variable para datos de operación
         self.last_operation_info = {}
-        self.agent_decisions = {}
+        self.policy_choices = {}
 
         # Orden FIFO inmutable: simplemente el índice de creación del flujo
-        # (flows ya está en el mismo orden en que se generaron).
-        self._fifo_order = list(range(self.num_flows))
+        # (traffic_streams ya está en el mismo orden en que se generaron).
+        self._fifo_order = list(range(self.stream_count))
 
         # ──────────────────────────────────────────────────────────────
         #  📊  Métricas de latencia extremo-a-extremo (µs) por episodio
@@ -177,29 +179,62 @@ class NetEnv(gym.Env):
 
     # --------------------------------------------------------------------- #
     #  Configuración de gymnasium                                           #
-    # --------------------------------------------------------------------- #
-    def _default_gcl_info(self):
+    # --------------------------------------------------------------------- #    def _default_gcl_info(self):
         return self.GclInfo()
 
     def _setup_spaces(self):
         # MODIFICAR LA OBSERVACIÓN: Incluir información de múltiples flujos (hasta 5)
-        # Para cada flujo: [período_norm, payload_norm, progreso, tiempo_espera_norm, es_seleccionable]
+        # Para cada flujo: [período_norm, normalized_size, progreso, tiempo_espera_norm, es_seleccionable]
         # Además de las características globales originales
-        FLUJOS_OBSERVABLES = 5  # Número de flujos que podemos observar a la vez
-        FEATURES_POR_FLUJO = 5  # Características por flujo
-        FEATURES_GLOBALES = 4   # Características globales (tiempo, ocupación GCL, etc.)
-        
-        self.observation_space = spaces.Box(
-            low=0.0, 
-            high=1.0, 
-            shape=(FEATURES_GLOBALES + FLUJOS_OBSERVABLES * FEATURES_POR_FLUJO,), 
-            dtype=np.float32
-        )
+        OBSERVABLE_STREAMS = 5  # Número de flujos que podemos observar a la vez
+        STREAM_ATTRIBUTES = 5  # Características por flujo
+        GLOBAL_ATTRIBUTES = 4   # Características globales (tiempo, ocupación GCL, etc.)
         
         # NUEVO: Almacenar constantes para uso posterior
-        self.NUM_FLUJOS_OBSERVABLES = FLUJOS_OBSERVABLES
-        self.FEATURES_POR_FLUJO = FEATURES_POR_FLUJO
-        self.FEATURES_GLOBALES = FEATURES_GLOBALES
+        self.MAX_OBSERVABLE_STREAMS = OBSERVABLE_STREAMS
+        self.STREAM_ATTRIBUTES = STREAM_ATTRIBUTES
+        self.GLOBAL_ATTRIBUTES = GLOBAL_ATTRIBUTES
+        
+        if self.graph_mode_enabled:
+            # Dict observation space for network_structure-based extractors (HATSExtractor)
+            vertex_count = len(self.network_structure.nodes())
+            connection_count = len(self.network_structure.edges())
+            path_limit = max(len(data_stream.path) for data_stream in self.traffic_streams) if self.traffic_streams else 10
+            
+            self.observation_space = spaces.Dict({
+                'attribute_matrix': spaces.Box(
+                    low=-1.0, high=1.0, 
+                    shape=(vertex_count, 8), dtype=np.float32
+                ),
+                'connection_properties': spaces.Box(
+                    low=0.0, high=1.0, 
+                    shape=(connection_count, 4), dtype=np.float32
+                ),
+                'topology_matrix': spaces.Box(
+                    low=0, high=1, 
+                    shape=(vertex_count, vertex_count), dtype=np.int32
+                ),
+                'flow_feature': spaces.Box(
+                    low=0.0, high=1.0, 
+                    shape=(6,), dtype=np.float32
+                ),
+                'link_feature': spaces.Box(
+                    low=0.0, high=1.0, 
+                    shape=(4,), dtype=np.float32
+                ),
+                'remain_hops': spaces.Box(
+                    low=0, high=path_limit, 
+                    shape=(path_limit,), dtype=np.int32
+                )
+            })
+        else:
+            # Box observation space for standard extractors (AttributeProcessor)
+            self.observation_space = spaces.Box(
+                low=0.0, 
+                high=1.0, 
+                shape=(GLOBAL_ATTRIBUTES + OBSERVABLE_STREAMS * STREAM_ATTRIBUTES,), 
+                dtype=np.float32
+            )
 
         # ╔═══════════════════════════════════════════════════════════════════════╗
         # ║  ESPACIO DE ACCIÓN (3 DIMENSIONES)                                    ║
@@ -210,68 +245,68 @@ class NetEnv(gym.Env):
         self.action_space = spaces.MultiDiscrete([
             5,                 # Guard factor
             4,                 # Gap mínimo switch
-            FLUJOS_OBSERVABLES # Selección de flujo
+            OBSERVABLE_STREAMS # Selección de flujo
         ])
 
     # --------------------------------------------------------------------- #
     #  Utilidades de selección de flujo / enlace                            #
     # --------------------------------------------------------------------- #
-    def select_next_flow_by_agent(self, flow_selection):
+    def select_next_flow_by_agent(self, stream_choice):
         """
         Permite que el agente RL seleccione el próximo flujo a programar.
         
         Args:
-            flow_selection: Índice del flujo seleccionado por el agente (0-4)
+            stream_choice: Índice del flujo seleccionado por el agente (0-4)
         """
         # Usar el índice de flujo seleccionado por el agente si está disponible
-        if hasattr(self, 'current_candidate_flows') and self.current_candidate_flows:
-            if 0 <= flow_selection < len(self.current_candidate_flows):
-                selected_idx = self.current_candidate_flows[flow_selection]
-                if not self.flow_completed[selected_idx]:
-                    self.current_flow_idx = selected_idx
+        if hasattr(self, 'active_nominees') and self.active_nominees:
+            if 0 <= stream_choice < len(self.active_nominees):
+                chosen_identifier = self.active_nominees[stream_choice]
+                if not self.stream_finished[chosen_identifier]:
+                    self.active_stream_id = chosen_identifier
                     return
 
         # Si la selección directa falla, usar FIFO como fallback
-        now = self.global_time
-        chosen = None  # (idx, wait_time)
+        current_instant = self.simulation_clock
+        selected_option = None  # (identifier, waiting_duration)
 
-        for idx, done in enumerate(self.flow_completed):
-            if done:
+        for identifier, episode_complete in enumerate(self.stream_finished):
+            if episode_complete:
                 continue
-            prog = self.flow_progress[idx]
-            if prog == 0 or prog >= len(self.flows[idx].path):
+            advancement = self.stream_advancement[identifier]
+            if advancement == 0 or advancement >= len(self.traffic_streams[identifier].path):
                 continue
-            next_link = self.flows[idx].path[prog]
+            next_link = self.traffic_streams[identifier].path[advancement]
             if not next_link[0].startswith('S'):
                 continue
 
-            prev_link_id = self.flows[idx].path[prog-1]
-            prev_ops = self.links_operations[self.link_dict[prev_link_id]]
-            if not prev_ops:
+            upstream_identifier = self.traffic_streams[identifier].path[advancement-1]
+            prior_activities = self.connection_activities[self.connection_registry[upstream_identifier]]
+            if not prior_activities:
                 continue  # el hop previo aún no fue programado
-            prev_op = prev_ops[-1][1]
-            wait_time = now - prev_op.reception_time
-            if chosen is None or wait_time > chosen[1]:
-                chosen = (idx, wait_time)
+            previous_operation = prior_activities[-1][1]
+            waiting_duration = current_instant - previous_operation.reception_time
+            if selected_option is None or waiting_duration > selected_option[1]:
+                selected_option = (identifier, waiting_duration)
 
-        if chosen:
-            self.current_flow_idx = chosen[0]
+        if selected_option:
+            self.active_stream_id = selected_option[0]
             return
                 
         # Si no se encontró un flujo adecuado, buscar cualquier flujo no completado
-        if self.flow_completed[self.current_flow_idx]:
-            for idx, completed in enumerate(self.flow_completed):
+        if self.stream_finished[self.active_stream_id]:
+            for identifier, completed in enumerate(self.stream_finished):
                 if not completed:
-                    self.current_flow_idx = idx
+                    self.active_stream_id = identifier
                     return
 
     def current_flow(self):
-        return self.flows[self.current_flow_idx]
+        return self.traffic_streams[self.active_stream_id]
 
     def current_link(self):
-        idx = self.flow_progress[self.current_flow_idx]
-        flow = self.current_flow()
-        return self.link_dict[flow.path[idx]]
+        identifier = self.stream_advancement[self.active_stream_id]
+        data_stream = self.current_flow()
+        return self.connection_registry[data_stream.path[identifier]]
 
     # ----------------------------------------------------------------- #
     #  FIFO helper                                                      #
@@ -286,47 +321,47 @@ class NetEnv(gym.Env):
         1. Paquetes que están esperando en un switch (para transmisión inmediata)
         2. Paquetes con mayor tiempo de espera
         """
-        best: tuple[int, int, bool, int] | None = None   # (wait_time, -idx, is_in_switch, hop_idx)
-        best_idx: int | None = None
+        optimal_candidate: tuple[int, int, bool, int] | None = None   # (waiting_duration, -identifier, queued_in_switch, segment_index)
+        optimal_index: int | None = None
 
-        now = self.global_time
-        for idx, done in enumerate(self.flow_completed):
-            if done:
+        current_instant = self.simulation_clock
+        for identifier, episode_complete in enumerate(self.stream_finished):
+            if episode_complete:
                 continue
-            hop_idx = self.flow_progress[idx]
-            if hop_idx >= len(self.flows[idx].path):
+            segment_index = self.stream_advancement[identifier]
+            if segment_index >= len(self.traffic_streams[identifier].path):
                 continue
 
             # --- tiempo desde que el paquete está "listo" ---
-            if hop_idx == 0:
-                ready_t = 0                          # nunca se ha transmitido
-                is_in_switch = False
+            if segment_index == 0:
+                preparation_time = 0                          # nunca se ha transmitido
+                queued_in_switch = False
             else:
-                prev_link_id = self.flows[idx].path[hop_idx - 1]
-                prev_ops = self.links_operations.get(self.link_dict[prev_link_id], [])
-                if not prev_ops:
+                upstream_identifier = self.traffic_streams[identifier].path[segment_index - 1]
+                prior_activities = self.connection_activities.get(self.connection_registry[upstream_identifier], [])
+                if not prior_activities:
                     continue        # hop previo aún no programado ⇒ no listo
                 
-                prev_op = prev_ops[-1][1]
-                ready_t = prev_op.reception_time
+                previous_operation = prior_activities[-1][1]
+                preparation_time = previous_operation.reception_time
                 
                 # Determinar si el paquete está esperando en un switch
                 # Si el destino del enlace anterior es un switch y el origen del siguiente enlace
                 # coincide con ese switch, entonces el paquete está esperando en un switch
-                dst_node = prev_link_id[1] if isinstance(prev_link_id, tuple) else prev_link_id.split('-')[1]
-                is_in_switch = dst_node.startswith('S') and not dst_node.startswith('SRV')
+                target_endpoint = upstream_identifier[1] if isinstance(upstream_identifier, tuple) else upstream_identifier.split('-')[1]
+                queued_in_switch = target_endpoint.startswith('S') and not target_endpoint.startswith('SRV')
 
-            wait = now - ready_t
-            fifo_rank = -idx               # menor índice ⇒ más antiguo
+            queue_time = current_instant - preparation_time
+            priority_order = -identifier               # menor índice ⇒ más antiguo
             
             # Prioridad: 1) paquetes en switch, 2) tiempo de espera, 3) índice más bajo
-            cand = (int(is_in_switch), wait, fifo_rank, hop_idx)
+            candidate = (int(queued_in_switch), queue_time, priority_order, segment_index)
 
-            if (best is None) or (cand > best):
-                best = cand
-                best_idx = idx
+            if (optimal_candidate is None) or (candidate > optimal_candidate):
+                optimal_candidate = candidate
+                optimal_index = identifier
 
-        return best_idx
+        return optimal_index
 
     # --------------------------------------------------------------------- #
     #  Reinicio                                                             #
@@ -334,45 +369,45 @@ class NetEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         
-        # Si es necesario incrementar la complejidad
-        if self.curriculum_enabled and self.consecutive_successes >= 3:
+        # Si es necesario incrementar la complejidad - MÁS CONSERVADOR
+        if self.adaptive_learning and self.streak_count >= 5:  # Aumentar de 3 a 5 éxitos
             if self.increase_complexity():
                 # Calcular número de flujos según complejidad actual
-                num_flows = int(self.total_flows * self.current_complexity)
-                num_flows = max(5, min(self.total_flows, num_flows))
+                stream_count = int(self.complete_stream_count * self.difficulty_level)
+                stream_count = max(5, min(self.complete_stream_count, stream_count))
                 
-                if self.original_flows:
+                if self.complete_stream_set:
                     # Usar un subset consistente de los flujos originales
-                    active_flows_list = self.original_flows[:num_flows]
-                    network = Network(self.base_graph, active_flows_list)
+                    stream_collection = self.complete_stream_set[:stream_count]
+                    infrastructure = Network(self.network_topology, stream_collection)
                     
                     # Actualizar las estructuras con la nueva red
-                    self.graph = network.graph
-                    self.flows = list(network.flows)
-                    self.line_graph, self.link_dict = (
-                        network.line_graph,
-                        network.links_dict,
+                    self.network_structure = infrastructure.network_structure
+                    self.traffic_streams = list(infrastructure.traffic_streams)
+                    self.line_graph, self.connection_registry = (
+                        infrastructure.line_graph,
+                        infrastructure.links_dict,
                     )
-                    self.num_flows = len(self.flows)
+                    self.stream_count = len(self.traffic_streams)
                     
-                    self.logger.info(f"Curriculum: Incrementando a {num_flows}/{self.total_flows} flujos (complejidad: {self.current_complexity:.2f})")
+                    self.event_recorder.info(f"Curriculum: Incrementando a {stream_count}/{self.complete_stream_count} flujos (complejidad: {self.difficulty_level:.2f})")
                 
-            self.consecutive_successes = 0
+            self.streak_count = 0
 
-        self.global_time = 0
-        self.flow_progress = [0] * self.num_flows
-        self.flow_completed = [False] * self.num_flows
-        self.flow_first_tx = [None] * self.num_flows
-        self.current_flow_idx = 0
+        self.simulation_clock = 0
+        self.stream_advancement = [0] * self.stream_count
+        self.stream_finished = [False] * self.stream_count
+        self.initial_transmission = [None] * self.stream_count
+        self.active_stream_id = 0
 
-        self.links_operations.clear()
-        self.links_gcl = {}   # reiniciar placeholder
-        self.temp_operations.clear()
+        self.connection_activities.clear()
+        self.connection_schedules = {}   # reiniciar placeholder
+        self.provisional_activities.clear()
         self._es_node_cache.clear()
-        self.link_busy_until.clear()
-        self.switch_busy_until.clear()
-        self.switch_last_arrival.clear()    # NUEVO: Limpiar tiempos de llegada
-        self.global_queue_busy_until = 0
+        self.connection_free_time.clear()
+        self.node_free_time.clear()
+        self.node_last_reception.clear()    # NUEVO: Limpiar tiempos de llegada
+        self.system_busy_time = 0
         self.last_packet_start = -Net.PACKET_GAP_EXTRA
 
         # Limpiar métricas de latencia para el nuevo episodio
@@ -381,129 +416,274 @@ class NetEnv(gym.Env):
         # ⏱️  reiniciar latencias e2e acumuladas
         self._flow_latencies.clear()
 
-        return self._get_observation(), {}
-
-    # --------------------------------------------------------------------- #
+        return self._get_observation(), {}    # --------------------------------------------------------------------- #
     #  Observación                                                          #
     # --------------------------------------------------------------------- #
     def _get_observation(self):
+        if self.graph_mode_enabled:
+            return self._get_graph_observation()
+        else:
+            return self._get_vector_observation()
+    
+    def _get_vector_observation(self):
+        """Get traditional Box observation for standard extractors"""
         # Creamos una observación que contenga información sobre múltiples flujos
         # La observación tendrá: [características_globales, características_flujo1, características_flujo2, ...]
         
         # 1. Características globales de la red
-        global_time_norm = self.global_time / 10000  # Normalizar tiempo global
+        normalized_time = self.simulation_clock / 10000  # Normalizar tiempo global
         
         # Ya no hay GCL dinámico → utilización 0 siempre
-        gcl_util_norm = 0.0
+        schedule_utilization = 0.0
         
         # Calcular porcentaje de flujos completados
-        completion_rate = sum(self.flow_completed) / self.num_flows
+        finish_ratio = sum(self.stream_finished) / self.stream_count
         
         # Nivel de curriculum
-        curriculum_norm = self.current_complexity
+        learning_progress = self.difficulty_level
         
         # Vector de características globales
-        global_features = [global_time_norm, gcl_util_norm, completion_rate, curriculum_norm]
+        global_features = [normalized_time, schedule_utilization, finish_ratio, learning_progress]
         
-        # 2. Obtener una lista de flujos candidatos para programar
-        candidatos = []
-        for idx, completed in enumerate(self.flow_completed):
+        # 2. Obtener una lista de flujos nominees para programar
+        nominees = []
+        for identifier, completed in enumerate(self.stream_finished):
             if not completed:
-                flow = self.flows[idx]
-                hop_idx = self.flow_progress[idx]
+                data_stream = self.traffic_streams[identifier]
+                segment_index = self.stream_advancement[identifier]
                 
                 # Verificar que el flujo tiene un hop válido para programar
-                if hop_idx >= len(flow.path):
+                if segment_index >= len(data_stream.path):
                     continue
                     
                 # Calcular cuánto tiempo ha estado esperando (si aplica)
-                wait_time = 0
-                if hop_idx > 0:
-                    prev_link_id = flow.path[hop_idx-1]
-                    prev_ops = self.links_operations.get(self.link_dict[prev_link_id], [])
-                    if prev_ops:
-                        prev_op = prev_ops[-1][1]
-                        wait_time = max(0, self.global_time - prev_op.reception_time)
+                waiting_duration = 0
+                if segment_index > 0:
+                    upstream_identifier = data_stream.path[segment_index-1]
+                    prior_activities = self.connection_activities.get(self.connection_registry[upstream_identifier], [])
+                    if prior_activities:
+                        previous_operation = prior_activities[-1][1]
+                        waiting_duration = max(0, self.simulation_clock - previous_operation.reception_time)
                 
                 # Normalizar valores - convertir a características significativas 
-                period_norm = flow.period / 10000  # Períodos más cortos → valores más pequeños
-                payload_norm = flow.payload / Net.MTU  # Payloads más pequeños → valores más pequeños
-                hop_progress = self.flow_progress[idx] / len(flow.path)
-                wait_time_norm = min(wait_time / flow.period, 1.0)  # Normalizar por periodo
+                normalized_period = data_stream.period / 10000  # Períodos más cortos → valores más pequeños
+                normalized_size = data_stream.payload / Net.MTU  # Payloads más pequeños → valores más pequeños
+                path_position = self.stream_advancement[identifier] / len(data_stream.path)
+                normalized_wait = min(waiting_duration / data_stream.period, 1.0)  # Normalizar por periodo
                 
                 # Calcular urgencia basada en plazo próximo
                 # Cuanto menor sea el tiempo hasta el deadline, mayor urgencia (1.0 = muy urgente)
-                deadline_remaining = (flow.period - (self.global_time % flow.period)) / flow.period
-                urgency = 1.0 - deadline_remaining  # 0.0 = acaba de empezar, 1.0 = casi vencido
+                time_budget = (data_stream.period - (self.simulation_clock % data_stream.period)) / data_stream.period
+                priority_score = 1.0 - time_budget  # 0.0 = acaba de empezar, 1.0 = casi vencido
                 
                 # Log del flujo candidato con sus características para depuración
-                self.logger.debug(f"Candidato: {flow.flow_id}, Period: {period_norm:.2f}, Payload: {payload_norm:.2f}, Wait: {wait_time_norm:.2f}, Urgency: {urgency:.2f}")
+                self.event_recorder.debug(f"Candidato: {data_stream.flow_id}, Period: {normalized_period:.2f}, Payload: {normalized_size:.2f}, Wait: {normalized_wait:.2f}, Urgency: {priority_score:.2f}")
                 
-                # Añadir a candidatos con sus características
-                candidatos.append((idx, [period_norm, payload_norm, hop_progress, wait_time_norm, urgency]))
+                # Añadir a nominees con sus características
+                nominees.append((identifier, [normalized_period, normalized_size, path_position, normalized_wait, priority_score]))
         
-        # 3. Si no hay candidatos, devolver una observación con ceros
-        if not candidatos:
-            return np.zeros(self.observation_space.shape, dtype=np.float32)
+        # 3. Si no hay nominees, devolver una observación con ceros
+        if not nominees:
+            if self.graph_mode_enabled:
+                return self._get_empty_graph_observation()
+            else:
+                return np.zeros(self.observation_space.shape, dtype=np.float32)
         
-        # 4. Ordenar candidatos de forma significativa para el agente
+        # 4. Ordenar nominees de forma significativa para el agente
         # Considerar múltiples factores: tiempo espera (FIFO), urgencia, tamaño payload
-        candidatos = sorted(candidatos, key=lambda x: (
-            x[1][3],  # Tiempo de espera (mayor primero - FIFO)
-            x[1][4],  # Urgencia (mayor primero)
-            -x[1][1]  # Payload (menor primero - más rápido)
+        nominees = sorted(nominees, key=lambda feature_tensor: (
+            feature_tensor[1][3],  # Tiempo de espera (mayor primero - FIFO)
+            feature_tensor[1][4],  # Urgencia (mayor primero)
+            -feature_tensor[1][1]  # Payload (menor primero - más rápido)
         ), reverse=True)
         
-        # Asegurar que tenemos exactamente NUM_FLUJOS_OBSERVABLES candidatos
-        if len(candidatos) > self.NUM_FLUJOS_OBSERVABLES:
-            candidatos = candidatos[:self.NUM_FLUJOS_OBSERVABLES]
+        # Asegurar que tenemos exactamente MAX_OBSERVABLE_STREAMS nominees
+        if len(nominees) > self.MAX_OBSERVABLE_STREAMS:
+            nominees = nominees[:self.MAX_OBSERVABLE_STREAMS]
         
-        while len(candidatos) < self.NUM_FLUJOS_OBSERVABLES:
-            candidatos.append((-1, [0.0, 0.0, 0.0, 0.0, 0.0]))
+        while len(nominees) < self.MAX_OBSERVABLE_STREAMS:
+            nominees.append((-1, [0.0, 0.0, 0.0, 0.0, 0.0]))
         
-        # 5. Actualizar los índices de flujos candidatos para recuperarlos después
-        self.current_candidate_flows = [idx for idx, _ in candidatos if idx >= 0]
+        # 5. Actualizar los índices de flujos nominees para recuperarlos después
+        self.active_nominees = [identifier for identifier, _ in nominees if identifier >= 0]
         
         # Registro para depuración
-        if self.current_candidate_flows:
-            self.logger.debug(f"Candidatos ordenados: {[self.flows[idx].flow_id for idx in self.current_candidate_flows]}")
+        if self.active_nominees:
+            self.event_recorder.debug(f"Candidatos ordenados: {[self.traffic_streams[identifier].flow_id for identifier in self.active_nominees]}")
         
         # 6. Construir la observación completa concatenando características
-        obs = np.array(global_features + [feat for _, feats in candidatos for feat in feats], dtype=np.float32)
+        current_state = np.array(global_features + [feature_vector for _, feats in nominees for feature_vector in feats], dtype=np.float32)
         
-        return obs
+        return current_state
+    
+    def _get_graph_observation(self):
+        """Get Dict observation for network_structure-based extractors (HATSExtractor)"""
+        try:
+            return self._neighbors_features()
+        except Exception as e:
+            self.event_recorder.warning(f"Error getting network_structure observation: {e}. Falling back to empty observation.")
+            return self._get_empty_graph_observation()
+    
+    def _get_empty_graph_observation(self):
+        """Return empty Dict observation when no candidates available"""
+        vertex_count = len(self.network_structure.nodes())
+        connection_count = len(self.network_structure.edges())
+        path_limit = max(len(data_stream.path) for data_stream in self.traffic_streams) if self.traffic_streams else 10
+        
+        return {
+            'attribute_matrix': np.zeros((vertex_count, 8), dtype=np.float32),
+            'connection_properties': np.zeros((connection_count, 4), dtype=np.float32),
+            'topology_matrix': np.array([[1 if self.network_structure.has_edge(iterator, j) else 0 
+                                         for j in range(vertex_count)] 
+                                        for iterator in range(vertex_count)], dtype=np.int32),
+            'flow_feature': np.zeros((6,), dtype=np.float32),
+            'link_feature': np.zeros((4,), dtype=np.float32),
+            'remain_hops': np.zeros((path_limit,), dtype=np.int32)
+        }
+    
+    def _neighbors_features(self):
+        """
+        Build network_structure-based observation for HATSExtractor.
+        Returns Dict with network_structure structure and attribute_vector.
+        """
+        if not self.active_nominees or not self.traffic_streams:
+            return self._get_empty_graph_observation()
+        
+        # Get current data_stream being scheduled
+        flow_idx = self.active_nominees[0] if self.active_nominees else 0
+        if flow_idx >= len(self.traffic_streams):
+            return self._get_empty_graph_observation()
+            
+        data_stream = self.traffic_streams[flow_idx]
+        segment_index = self.stream_advancement[flow_idx]
+        
+        if segment_index >= len(data_stream.path):
+            return self._get_empty_graph_observation()
+        
+        # Graph structure
+        vertex_count = len(self.network_structure.nodes())
+        connection_count = len(self.network_structure.edges())
+        
+        # Node attribute_vector matrix (vertex_count feature_tensor 8)
+        attribute_matrix = np.zeros((vertex_count, 8), dtype=np.float32)
+        vertex_catalog = list(self.network_structure.nodes())
+        
+        for iterator, node in enumerate(vertex_catalog):
+            # Basic node attribute_vector
+            attribute_matrix[iterator, 0] = len(list(self.network_structure.neighbors(node))) / vertex_count  # Degree normalized
+            attribute_matrix[iterator, 1] = 1.0 if node in data_stream.path else 0.0  # In current data_stream path
+            attribute_matrix[iterator, 2] = 1.0 if iterator == segment_index and node in data_stream.path else 0.0  # Current hop
+            
+            # Traffic load attribute_vector
+            node_load = sum(1 for f_idx, flow_generator in enumerate(self.traffic_streams) 
+                           if not self.stream_finished[f_idx] and node in flow_generator.path)
+            attribute_matrix[iterator, 3] = node_load / len(self.traffic_streams)  # Normalized load
+            
+            # Timing attribute_vector
+            attribute_matrix[iterator, 4] = self.simulation_clock / 10000.0  # Normalized time
+            attribute_matrix[iterator, 5] = self.difficulty_level
+            
+            # Buffer/congestion indicators (simplified)
+            attribute_matrix[iterator, 6] = 0.5  # Placeholder for buffer utilization
+            attribute_matrix[iterator, 7] = 0.0  # Placeholder for congestion
+        
+        # Edge attribute_vector matrix (connection_count feature_tensor 4)  
+        connection_properties = np.zeros((connection_count, 4), dtype=np.float32)
+        connection_catalog = list(self.network_structure.edges())
+        
+        for iterator, (source_node, destination_node) in enumerate(connection_catalog):
+            # Edge load and utilization
+            link_utilization = sum(1 for f_idx, flow_generator in enumerate(self.traffic_streams)
+                           if not self.stream_finished[f_idx] and 
+                           any(flow_generator.path[j] == source_node and flow_generator.path[j+1] == destination_node 
+                               for j in range(len(flow_generator.path)-1)))
+            connection_properties[iterator, 0] = link_utilization / len(self.traffic_streams)  # Load
+            connection_properties[iterator, 1] = 1.0 if (source_node, destination_node) in [(data_stream.path[j], data_stream.path[j+1]) 
+                                                        for j in range(len(data_stream.path)-1)] else 0.0  # In current path
+            connection_properties[iterator, 2] = 0.5  # Bandwidth utilization (placeholder)
+            connection_properties[iterator, 3] = 0.0  # Latency (placeholder)
+        
+        # Adjacency matrix
+        topology_matrix = np.array([[1 if self.network_structure.has_edge(iterator, j) else 0 
+                                     for j in range(vertex_count)] 
+                                    for iterator in range(vertex_count)], dtype=np.int32)
+        
+        # Flow attribute_vector (6 attribute_vector)
+        flow_feature = np.array([
+            data_stream.period / 10000.0,  # Normalized period
+            data_stream.payload / Net.MTU,  # Normalized payload
+            segment_index / len(data_stream.path),  # Progress
+            (self.simulation_clock % data_stream.period) / data_stream.period,  # Phase in period
+            len(data_stream.path) / vertex_count,  # Path length normalized
+            sum(self.stream_finished) / len(self.traffic_streams)  # Completion rate
+        ], dtype=np.float32)
+        
+        # Link attribute_vector (4 attribute_vector) - current network_connection being scheduled
+        if segment_index < len(data_stream.path) - 1:
+            current_link = (data_stream.path[segment_index], data_stream.path[segment_index + 1])
+            link_feature = np.array([
+                1.0,  # Link is active
+                connection_properties[connection_catalog.index(current_link), 0] if current_link in connection_catalog else 0.0,  # Load
+                0.5,  # Bandwidth (placeholder)
+                self.simulation_clock / 10000.0  # Current time
+            ], dtype=np.float32)
+        else:
+            link_feature = np.zeros((4,), dtype=np.float32)
+        
+        # Remaining path_segments
+        path_limit = max(len(flow_generator.path) for flow_generator in self.traffic_streams) if self.traffic_streams else 10
+        remain_hops = np.zeros((path_limit,), dtype=np.int32)
+        pending_segments = len(data_stream.path) - segment_index
+        if pending_segments > 0:
+            remain_hops[:min(pending_segments, path_limit)] = 1
+        
+        return {
+            'attribute_matrix': attribute_matrix,
+            'connection_properties': connection_properties, 
+            'topology_matrix': topology_matrix,
+            'flow_feature': flow_feature,
+            'link_feature': link_feature,
+            'remain_hops': remain_hops
+        }
 
     # ------------------------------------------------------------------ #
     #  Máscaras de acción                                                #
     # ------------------------------------------------------------------ #
-    def action_masks(self):
+    def permitted_actions(self):
         """
         Genera máscaras para el espacio de acción MultiDiscreto.
         """
         # Calcular tamaño total de la máscara sumando todas las dimensiones
-        mask_size = sum(self.action_space.nvec)
+        constraint_count = sum(self.action_space.nvec)
         
         # Crear una máscara plana donde todas las acciones están permitidas (0 = permitida)
-        mask = np.zeros(mask_size, dtype=np.int8)
+        validity_vector = np.zeros(constraint_count, dtype=np.int8)
         
         try:
-            if self.current_flow_idx < len(self.flows) and not self.flow_completed[self.current_flow_idx]:
-                flow = self.current_flow()
-                hop_idx = self.flow_progress[self.current_flow_idx]
+            if self.active_stream_id < len(self.traffic_streams) and not self.stream_finished[self.active_stream_id]:
+                data_stream = self.current_flow()
+                segment_index = self.stream_advancement[self.active_stream_id]
                 
-                if hop_idx < len(flow.path):
-                    link = self.link_dict[flow.path[hop_idx]]
+                if segment_index < len(data_stream.path):
+                    network_connection = self.connection_registry[data_stream.path[segment_index]]
                     
                     # Si es el primer hop, los factores de guard time altos podrían desperdiciarse
-                    if hop_idx == 0:
+                    if segment_index == 0:
                         # Índice para guard time alto
-                        offset = 0  # No offset needed anymore
-                        mask[offset + 3] = 1  # Desactivar valores 3 y 4 (factores altos)
-                        mask[offset + 4] = 1
+                        time_adjustment = 0  # No time_adjustment needed anymore
+                        validity_vector[time_adjustment + 3] = 1  # Desactivar valores 3 y 4 (factores altos)
+                        validity_vector[time_adjustment + 4] = 1
         except Exception as e:
-            self.logger.warning(f"Error generando máscaras de acción: {e}")
+            self.event_recorder.warning(f"Error generando máscaras de acción: {e}")
             
-        return mask
+        return validity_vector
+
+    def action_masks(self):
+        """
+        Genera máscaras para el espacio de acción MultiDiscreto.
+        Método requerido por MaskablePPO.
+        """
+        return self.permitted_actions()
 
     # --------------------------------------------------------------------- #
     #  Comprobaciones de aislamiento y GCL                                  #
@@ -520,42 +700,44 @@ class NetEnv(gym.Env):
         if link_id in self._es_node_cache:
             return self._es_node_cache[link_id]
 
-        src = link_id[0] if isinstance(link_id, tuple) else link_id.split('-')[0]
+        source_node = link_id[0] if isinstance(link_id, tuple) else link_id.split('-')[0]
 
         # a) Metadata del grafo (más robusta)
-        if self.graph.nodes.get(src, {}).get("node_type") == "ES":
+        if self.network_structure.nodes.get(source_node, {}).get("node_type") == "ES":
             self._es_node_cache[link_id] = True
             return True
 
         # b) Convención de nombres
-        is_es = src.startswith(("E", "C", "SRV"))
+        is_es = source_node.startswith(("E", "C", "SRV"))
         self._es_node_cache[link_id] = is_es
         return is_es
 
     #  ⛔  Retirado.  La agrupación de GCL dejó de ser necesaria.
 
-    def _check_valid_link(self, link, operation):
-        return check_valid_link(link, operation, self.current_flow(), self.links_operations)
+    def _check_valid_link(self, network_connection, operation):
+        return check_valid_link(network_connection, operation, self.current_flow(), self.connection_activities)
 
     def _check_temp_operations(self):
-        return check_temp_operations(self.temp_operations, self.links_operations, self.current_flow())
+        return check_temp_operations(self.provisional_activities, self.connection_activities, self.current_flow())
 
-    def _find_next_event_time(self, current_time):
-        """Encuentra el siguiente tiempo de evento programado después de current_time"""
-        return find_next_event_time(self.link_busy_until, self.switch_busy_until, current_time)
+    def _find_next_event_time(self, system_clock):
+        """Encuentra el siguiente tiempo de evento programado después de system_clock"""
+        return find_next_event_time(self.connection_free_time, self.node_free_time, system_clock)
 
     # Método obsoleto: generación dinámica de GCL eliminada.
     # Se mantiene para compatibilidad pero no hace nada y devuelve False.
-    def add_gating_with_grouping(self, *args, **kwargs):
+    def add_gating_with_grouping(self, *args, **optional_params):
         return False
 
     def increase_complexity(self):
-        """Incrementa el nivel de dificultad del entorno"""
-        if not self.curriculum_enabled or self.current_complexity >= 1.0:
+        """Incrementa el nivel de dificultad del entorno de forma MÁS CONSERVADORA"""
+        if not self.adaptive_learning or self.difficulty_level >= 1.0:
             return False
             
-        # Incrementar complejidad gradualmente
-        self.current_complexity = min(1.0, self.current_complexity + self.curriculum_step)
+        # Incrementar complejidad más lentamente para evitar colapso
+        # Reducir incremento de 0.05 (5%) a 0.02 (2%)
+        conservative_increment = self.advancement_rate * 0.4  # 40% del rate original
+        self.difficulty_level = min(1.0, self.difficulty_level + conservative_increment)
         return True
 
     # --------------------------------------------------------------------- #

@@ -27,31 +27,31 @@ pass  # <-- mantener el archivo, sin lógica de GCL
 # --------------------------------------------------------------------------- #
 # Funciones para la implementación del método step                            #
 # --------------------------------------------------------------------------- #
-def process_step_action(self, action):
+def process_step_action(self, command):
     """Procesa la acción en el método step"""
     # -------------------------------------------------------------- #
     # 0. Interpretar la acción con componentes reducidos              #
     # -------------------------------------------------------------- #
     # La acción ahora es un array con 3 componentes
-    guard_factor_idx  = int(action[0])
-    switch_gap_idx    = int(action[1])
-    flow_selection    = int(action[2])
+    protection_level  = int(command[0])
+    spacing_level    = int(command[1])
+    stream_choice    = int(command[2])
     
     # Convertir índices en valores reales para usar en el algoritmo
-    offset_us = 0
-    guard_factor_values = [0.5, 0.75, 1.0, 1.5, 2.0]
-    guard_factor = guard_factor_values[guard_factor_idx]
-    switch_gap_values = [0.5, 1.0, 1.5, 2.0]
-    switch_gap = switch_gap_values[switch_gap_idx]
+    timing_offset = 0
+    protection_options = [0.5, 0.75, 1.0, 1.5, 2.0]
+    protection_multiplier = protection_options[protection_level]
+    spacing_options = [0.5, 1.0, 1.5, 2.0]
+    inter_packet_spacing = spacing_options[spacing_level]
     
     # Registrar las decisiones del agente para visualización
-    flow = self.current_flow()
+    data_stream = self.current_flow()
     
-    # Almacenar todas las decisiones del agente (sin gcl_strategy)
-    self.agent_decisions = {
-        'guard_factor': guard_factor,
-        'switch_gap': switch_gap,
-        'flow_selection': flow_selection
+    # Almacenar todas las decisiones del agente (sin scheduling_policy)
+    self.policy_choices = {
+        'protection_multiplier': protection_multiplier,
+        'inter_packet_spacing': inter_packet_spacing,
+        'stream_choice': stream_choice
     }
     
     # NUEVO: Métricas de operación para el análisis
@@ -65,32 +65,32 @@ def process_step_action(self, action):
         }
     }
 
-    flow = self.current_flow()
-    hop_idx = self.flow_progress[self.current_flow_idx]
-    link = self.link_dict[flow.path[hop_idx]]
-    gating = True
-    trans_time = link.transmission_time(flow.payload)
+    data_stream = self.current_flow()
+    segment_index = self.stream_advancement[self.active_stream_id]
+    network_connection = self.connection_registry[data_stream.path[segment_index]]
+    time_synchronization = True
+    transmission_duration = network_connection.transmission_time(data_stream.payload)
     
     # Guard time ahora usa el factor elegido por el agente
-    base_guard_time = link.interference_time()
-    guard_time = base_guard_time * guard_factor
+    min_protection_interval = network_connection.interference_time()
+    safety_interval = min_protection_interval * protection_multiplier
     
     # Registrar las decisiones del agente para visualización posterior
-    self.guard_time_selected = guard_time
-    self.switch_gap_selected = switch_gap
+    self.chosen_protection = safety_interval
+    self.chosen_spacing = inter_packet_spacing
 
     # Si el ORIGEN del enlace es un switch ⇒ este hop ES un egress
     def _get_src(node_pair):
         return node_pair[0] if isinstance(node_pair, tuple) \
                else node_pair.split('-')[0]
 
-    sw_src = _get_src(link.link_id)
-    is_egress_from_switch = sw_src.startswith('S') and not sw_src.startswith('SRV')
+    sw_src = _get_src(network_connection.link_id)
+    outbound_from_switch = sw_src.startswith('S') and not sw_src.startswith('SRV')
     
     # Use fixed conservative GCL strategy
-    gcl_strategy = 0
+    scheduling_policy = 0
     
-    return (flow, hop_idx, link, gating, trans_time,
-            guard_time, guard_factor,               # ➊  NUEVO
-            offset_us, switch_gap, sw_src,
-            is_egress_from_switch, gcl_strategy)
+    return (data_stream, segment_index, network_connection, time_synchronization, transmission_duration,
+            safety_interval, protection_multiplier,               # ➊  NUEVO
+            timing_offset, inter_packet_spacing, sw_src,
+            outbound_from_switch, scheduling_policy)

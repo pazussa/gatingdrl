@@ -1,0 +1,20 @@
+================================================================================
+📊 REPORTE DE MÉTRICAS DE COMPLEJIDAD COMPUTACIONAL
+================================================================================
+🔢 PARÁMETROS FUNDAMENTALES:
+   F (flujos procesados): 0
+   H (saltos promedio por flujo): 0.00
+   K (operaciones totales): 0
+   I_avg (iteraciones promedio de conflictos): 0.00
+   H_max/T_min (ratio hiperperíodo/período): 0.00
+
+🧮 ESTIMACIÓN DE COMPLEJIDAD:
+   Fórmula: O((F·H)² × I_avg × H_max/T_min)
+   Valor calculado: 0.00e+00
+
+📋 COMPARACIÓN CON VALORES TEÓRICOS LATEX:
+   I_avg actual: 0.00 vs teórico: ~2.0
+   H_max/T_min actual: 0.00 vs teórico: ~10.0
+   F actual: 0 vs teórico: ≤200
+   H actual: 0.00 vs teórico: ≤5
+================================================================================

@@ -15,6 +15,10 @@ setup(
     install_requires=[
         "torch>=2.0.0",
         "torch-geometric>=2.3.0",
+        "torch-scatter>=2.1.0",
+        "torch-sparse>=0.6.0", 
+        "torch-cluster>=1.6.0",
+        "torch-spline-conv>=1.2.0",
         "networkx>=3.0",
         "matplotlib",
         "pandas",

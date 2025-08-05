@@ -3,11 +3,15 @@ import os
 from typing import Dict, List, Tuple
 import math
 from collections import defaultdict
+import time  # ← NUEVO: Para medir tiempo de inferencia
 
 import numpy as np
 from sb3_contrib import MaskablePPO
+from stable_baselines3 import A2C, DQN, PPO, SAC
 # Usamos el mismo extractor que durante el entrenamiento
-from core.learning.encoder import FeaturesExtractor
+from core.learning.encoder import AttributeProcessor
+from core.learning.hats_extractor import HATSExtractor
+from core.learning.maskable_sac import MaskableSAC
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 
@@ -22,35 +26,57 @@ ScheduleRes = Dict[Link, List[Tuple[Flow, Operation]]]
 class DrlScheduler:
     """Scheduler TSN usando Deep Reinforcement Learning con MaskablePPO"""
     
-    def __init__(self, network: Network, num_envs=1, timeout_s=300, use_curriculum=False):
+    SUPPORTING_ALG = {
+        'A2C': A2C,
+        'DQN': DQN,
+        'PPO': PPO,
+        'MaskablePPO': MaskablePPO,
+        'SAC': SAC,
+        'MaskableSAC': MaskableSAC
+    }
+    
+    def __init__(self, infrastructure: Network, num_envs=1, timeout_s=300, use_curriculum=False, alg='MaskablePPO', **optional_params):
         """Inicializa el scheduler con una red y opcionalmente número de entornos"""
-        self.network = network
-        self.num_flows = len(network.flows)
+        self.infrastructure = infrastructure
+        self.stream_count = len(infrastructure.traffic_streams)
         self.timeout_s = timeout_s
-        # ──────────────────────────────────────────────────────────────
+        self.alg = alg        # ──────────────────────────────────────────────────────────────
         #  INFERENCIA ⇒ un solo entorno
         #     Con varios envs el método schedule() se detiene en cuanto
         #     cualquiera termina (sea éxito o fallo), de modo que el
         #     primer fallo aborta el episodio y el recuento queda a 0.
         # ──────────────────────────────────────────────────────────────
         self.num_envs = 1
+        
+        # Permitir seleccionar extractor desde optional_params
+        fe_cls = optional_params.pop("features_extractor_class", None)
+        if fe_cls is None:
+            fe_cls = HATSExtractor if alg in ["SAC", "MaskableSAC"] else AttributeProcessor
+        
+        # Determinar si usar observaciones de grafo basado en el extractor
+        use_graph_obs = fe_cls == HATSExtractor or (fe_cls is not None and "HATS" in str(fe_cls))
+        
         self.env = DummyVecEnv([
             lambda: NetEnv(
-                network,
-                curriculum_enabled=use_curriculum,
-                initial_complexity=1.0   # 100 % de los flujos en test
+                infrastructure,
+                adaptive_learning=use_curriculum,
+                starting_difficulty=1.0,   # 100 % de los flujos en test
+                graph_mode_enabled=use_graph_obs
             )
         ])
-        # Mantener consistencia con el extractor usado al entrenar.
-        policy_kwargs = dict(features_extractor_class=FeaturesExtractor)
-        self.model = MaskablePPO(
+        
+        policy_kwargs = dict(features_extractor_class=fe_cls)
+        
+        # Usar el algoritmo especificado
+        alg_class = self.SUPPORTING_ALG.get(alg, MaskablePPO)
+        self.model = alg_class(
             "MlpPolicy",
             self.env,
             verbose=0,
             policy_kwargs=policy_kwargs,
         )
         self.res = None
-        logging.info(f"Scheduler inicializado con {self.num_flows} flujos (curriculum: {use_curriculum})")
+        logging.metadata(f"Scheduler inicializado con {self.stream_count} flujos (curriculum: {use_curriculum}), algoritmo: {alg}")
         
     def load_model(self, filepath: str, alg='MaskablePPO'):
         """Carga un modelo pre-entrenado"""
@@ -60,14 +86,17 @@ class DrlScheduler:
             logging.error(f"Modelo no encontrado: {filepath}.zip")
             return False
         try:
-            self.model = MaskablePPO.load(filepath, self.env)
-            logging.info(f"Modelo cargado: {filepath}")
+            # Usar el algoritmo correcto para cargar el modelo
+            alg_class = self.SUPPORTING_ALG.get(alg, MaskablePPO)
+            self.model = alg_class.load(filepath, self.env)
+            self.alg = alg
+            logging.metadata(f"Modelo cargado: {filepath} (algoritmo: {alg})")
             return True
         except Exception as e:
             logging.error(f"Error cargando modelo: {e}")
             return False
         
-    def schedule(self, max_episodes: int = 50, patience: int = 5) -> int:
+    def schedule(self, max_episodes: int = 100, patience: int = 5) -> int:
         """
         Intenta como máximo ``max_episodes`` y se detiene si durante
         ``patience`` episodios seguidos no mejora el mejor resultado.
@@ -81,62 +110,126 @@ class DrlScheduler:
         best_res: ScheduleRes | None = None
         best_count = 0
         no_improve = 0
+        # ⏱️ NUEVO: Variables para rastrear tiempos de inferencia
+        best_inference_time_ms = 0.0
+        total_test_episodes = 0
 
         log = logging.getLogger(__name__)
+        
+        # ⏱️ NUEVO: Log de inicio para debug
+        logging.metadata(f"🚀 INICIANDO SCHEDULER - máximo {max_episodes} episodios, paciencia {patience}")
 
         for ep in range(1, max_episodes + 1):
-            obs = self.env.reset()
-            done = False
+            current_state = self.env.reset()
+            episode_complete = False
+            
+            # ⏱️ NUEVO: Variables para medir tiempo de inferencia
+            total_inference_time = 0.0
+            inference_count = 0
 
-            while not done:
-                action_masks = np.vstack(self.env.env_method('action_masks'))
-                action, _ = self.model.predict(
-                    obs, deterministic=True,
-                    action_masks=action_masks.astype(np.int8)
+            while not episode_complete:
+                permitted_actions = np.vstack(self.env.env_method('action_masks'))
+                
+                # ⏱️ NUEVO: Medir tiempo de inferencia de cada predicción
+                start_inference_time = time.perf_counter()
+                command, _ = self.model.predict(
+                    current_state, deterministic=True,
+                    action_masks=permitted_actions.astype(np.int8)
                 )
-                obs, _, dones, infos = self.env.step(action)
-                done = any(dones)
+                end_inference_time = time.perf_counter()
+                
+                # Acumular tiempo y contador
+                inference_time = end_inference_time - start_inference_time
+                total_inference_time += inference_time
+                inference_count += 1
+                
+                current_state, _, dones, infos = self.env.step(command)
+                episode_complete = any(dones)
 
-                if not done:
+                if not episode_complete:
                     continue
 
                 # ---------- fin de episodio ----------
                 scheduled_cnt = 0
                 schedule_res = None
-                for i, is_done in enumerate(dones):
+                for iterator, is_done in enumerate(dones):
                     if not is_done:
                         continue
-                    schedule_res = infos[i].get('ScheduleRes')
+                    schedule_res = infos[iterator].get('ScheduleRes')
                     if schedule_res:
                         scheduled_cnt = {
-                            f.flow_id
+                            flow_generator.flow_id
                             for link_ops in schedule_res.values()
-                            for f, _ in link_ops
+                            for flow_generator, _ in link_ops
                         }.__len__()
                     break
+
+                # ⏱️ NUEVO: Log del tiempo de inferencia para este episodio
+                avg_inference_time_ms = (total_inference_time / inference_count * 1000) if inference_count > 0 else 0
+                total_inference_time_ms = total_inference_time * 1000
+                total_test_episodes += 1
+                
+                # Log básico para cada episodio (archivo de log)
+                log.info(f"[scheduler] episodio {ep}: {scheduled_cnt}/{self.stream_count} flujos - "
+                        f"⏱️ Tiempo de Inferencia: {total_inference_time_ms:.2f}ms total "
+                        f"({avg_inference_time_ms:.2f}ms promedio, {inference_count} decisiones)")
+                
+                # NUEVO: También imprimir en stdout para que aparezca en tee
+                print(f"⏱️ Test/Runtime - Episodio {ep}: Tiempo de Inferencia = {total_inference_time_ms:.2f}ms "
+                      f"(promedio: {avg_inference_time_ms:.2f}ms/decisión, {inference_count} decisiones)")
+                
+                # Log metadata adicional para archivos de log
+                logging.metadata(f"Test/Runtime - Episodio {ep}: ⏱️ Tiempo de Inferencia = {total_inference_time_ms:.2f}ms "
+                               f"(promedio: {avg_inference_time_ms:.2f}ms/decisión, {inference_count} decisiones totales)")
 
                 if scheduled_cnt > best_count:
                     best_count = scheduled_cnt
                     best_res = schedule_res
+                    best_inference_time_ms = total_inference_time_ms  # ⏱️ Guardar tiempo del mejor resultado
                     no_improve = 0
                     log.info(f"[scheduler] episodio {ep}: "
-                             f"nueva mejor marca {best_count}/{self.num_flows}")
-                    if best_count == self.num_flows:          # ¡perfecto!
+                             f"✅ NUEVA MEJOR MARCA {best_count}/{self.stream_count} - "
+                             f"⏱️ Tiempo de Inferencia: {total_inference_time_ms:.2f}ms")
+                    
+                    # NUEVO: También imprimir en stdout
+                    print(f"🎯 NUEVO RECORD - Episodio {ep}: {best_count}/{self.stream_count} flujos programados - "
+                          f"⏱️ Tiempo de Inferencia: {total_inference_time_ms:.2f}ms")
+                    
+                    # Metadata para mejores resultados
+                    logging.metadata(f"🎯 NUEVO RECORD - Episodio {ep}: {best_count}/{self.stream_count} flujos programados - "
+                                   f"⏱️ Tiempo de Inferencia: {total_inference_time_ms:.2f}ms")
+                    if best_count == self.stream_count:          # ¡perfecto!
                         self.res = best_res
+                        # ⏱️ Log final de éxito completo
+                        print(f"✅ SCHEDULER COMPLETADO EXITOSAMENTE - "
+                              f"Todos los {best_count} flujos programados - "
+                              f"⏱️ Tiempo de Inferencia del mejor episodio: {best_inference_time_ms:.2f}ms")
+                        logging.metadata(f"✅ SCHEDULER COMPLETADO EXITOSAMENTE - "
+                                       f"Todos los {best_count} flujos programados - "
+                                       f"⏱️ Tiempo de Inferencia del mejor episodio: {best_inference_time_ms:.2f}ms")
                         return best_count
                 else:
                     no_improve += 1
 
                 if no_improve >= patience:
                     log.warning(f"[scheduler] sin mejora en {patience} episodios; "
-                                f"mejor = {best_count}/{self.num_flows}.")
+                                f"mejor = {best_count}/{self.stream_count}.")
+                    # ⏱️ Log final con tiempo de inferencia
+                    logging.metadata(f"⚠️ SCHEDULER DETENIDO POR PACIENCIA - "
+                                   f"Mejor resultado: {best_count}/{self.stream_count} flujos - "
+                                   f"⏱️ Tiempo de Inferencia del mejor episodio: {best_inference_time_ms:.2f}ms")
                     self.res = best_res
                     return best_count
 
         # agotó max_episodes
         logging.getLogger(__name__).warning(
             f"[scheduler] alcanzado límite de {max_episodes} episodios; "
-            f"mejor = {best_count}/{self.num_flows}")
+            f"mejor = {best_count}/{self.stream_count}")
+        # ⏱️ Log final con tiempo de inferencia
+        logging.metadata(f"⏰ SCHEDULER LÍMITE DE EPISODIOS ALCANZADO - "
+                       f"Mejor resultado: {best_count}/{self.stream_count} flujos - "
+                       f"⏱️ Tiempo de Inferencia del mejor episodio: {best_inference_time_ms:.2f}ms "
+                       f"({total_test_episodes} episodios de prueba ejecutados)")
         self.res = best_res
         return best_count
 
@@ -150,15 +243,15 @@ class ResAnalyzer:
     # Threshold for GCL entry generation - easily modifiable class variable
     DEFAULT_GCL_GAP_THRESHOLD = 30
     
-    def __init__(self, network: Network, results: ScheduleRes):
+    def __init__(self, infrastructure: Network, results: ScheduleRes):
         """
         Inicializa el analizador y guarda resultados
         
         Args:
-            network: Red TSN
+            infrastructure: Red TSN
             results: Resultado del scheduling
         """
-        self.network = network
+        self.infrastructure = infrastructure
         self.results = results
         self.analyzer_id = id(self) # Generar un ID único para el analizador
         
@@ -178,12 +271,12 @@ class ResAnalyzer:
             filename = os.path.join(OUT_DIR, f'schedule_res_by_link_{self.analyzer_id}.log')
             try:
                 with open(filename, 'w') as f:
-                    for link, operations in results.items():
-                        f.write(f"Enlace: {link}\n")
-                        for flow, op in operations:
-                            f.write(f"  Flujo: {flow.flow_id}, Op: {op}\n")
+                    for network_connection, operations in results.items():
+                        f.write(f"Enlace: {network_connection}\n")
+                        for data_stream, operation_record in operations:
+                            f.write(f"  Flujo: {data_stream.flow_id}, Op: {operation_record}\n")
                         f.write("\n")
-                logging.info(f"Resultados guardados en {filename}")
+                logging.metadata(f"Resultados guardados en {filename}")
             except Exception as e:
                 logging.error(f"Error al guardar resultados: {e}")
 
@@ -208,35 +301,35 @@ class ResAnalyzer:
         if not self.results:
             return gcl_tables
 
-        for link, ops in self.results.items():
+        for network_connection, ops in self.results.items():
             # Sólo puertos cuyo ORIGEN es un switch ("S…", excluyendo "SRV…")
-            src = link.link_id[0] if isinstance(link.link_id, tuple) else link.link_id.split("-")[0]
-            if not (src.startswith("S") and not src.startswith("SRV")):
+            source_node = network_connection.link_id[0] if isinstance(network_connection.link_id, tuple) else network_connection.link_id.split("-")[0]
+            if not (source_node.startswith("S") and not source_node.startswith("SRV")):
                 continue
 
             # 1️⃣  Ordenar operaciones por inicio real (gating_time o start_time)
-            ops_sorted = sorted(ops, key=lambda p: (p[1].gating_time or p[1].start_time))
+            ops_sorted = sorted(ops, key=lambda probability: (probability[1].gating_time or probability[1].start_time))
             n = len(ops_sorted)
             if n == 0:
                 continue
 
             # 2️⃣  Calcular hiperperíodo de ese puerto
             gcl_cycle = 1
-            for f, _ in ops_sorted:
-                gcl_cycle = lcm(gcl_cycle, f.period)
+            for flow_generator, _ in ops_sorted:
+                gcl_cycle = lcm(gcl_cycle, flow_generator.period)
 
-            # 3️⃣  Analizar cada operación – reset de listas por-link
+            # 3️⃣  Analizar cada operación – reset de listas por-network_connection
             all_transmission_times: list[tuple[int, str]] = []
             all_reception_times:    list[tuple[int, str]] = []
             
             hyperperiod_link = gcl_cycle  # Hiperperiodo para este enlace
 
             #     Crear un par de eventos 0/1 por paquete
-            for i in range(n):
-                f_curr, op_curr = ops_sorted[i]
+            for iterator in range(n):
+                f_curr, op_curr = ops_sorted[iterator]
                 
                 # Índice del siguiente paquete (con wraparound)
-                next_idx = (i + 1) % n
+                next_idx = (iterator + 1) % n
                 f_next, op_next = ops_sorted[next_idx]
 
                 # Tiempo cuando termina de llegar este paquete (necesitamos cerrar el gate)
@@ -246,7 +339,7 @@ class ResAnalyzer:
                 open_time = op_next.gating_time or op_next.start_time
                 
                 # Si es el último paquete, añadir un período para el wraparound
-                if i == n - 1:
+                if iterator == n - 1:
                     open_time += f_next.period
 
                 # Calcular el gap entre recepción y siguiente transmisión
@@ -255,16 +348,16 @@ class ResAnalyzer:
                 # Para cada paquete, repetirlo durante todo el hiperperíodo
                 repetitions = hyperperiod_link // f_curr.period
                 for rep in range(repetitions):
-                    offset = rep * f_curr.period
+                    time_adjustment = rep * f_curr.period
                     # Guardar tiempo de inicio y recepción (normalizado al hiperperiodo)
-                    tx_t = (op_curr.start_time + offset) % hyperperiod_link
-                    rx_t = (op_curr.reception_time + offset) % hyperperiod_link
+                    tx_t = (op_curr.start_time + time_adjustment) % hyperperiod_link
+                    rx_t = (op_curr.reception_time + time_adjustment) % hyperperiod_link
                     all_transmission_times.append((tx_t, f_curr.flow_id))
                     all_reception_times.append((rx_t, f_curr.flow_id))
 
             # Ordenar los tiempos
-            all_transmission_times.sort(key=lambda x: x[0])
-            all_reception_times.sort(key=lambda x: x[0])
+            all_transmission_times.sort(key=lambda feature_tensor: feature_tensor[0])
+            all_reception_times.sort(key=lambda feature_tensor: feature_tensor[0])
             
             # PASO 2: Generar eventos GCL con la tabla COMPLETA
             gcl_close_events: list[tuple[int,str,int,str]] = []
@@ -314,7 +407,7 @@ class ResAnalyzer:
                 events.append((next_tx_time % hyperperiod_link, 1))
 
             # 4️⃣  Ordenar todos los eventos por tiempo
-            events.sort(key=lambda x: (x[0], x[1]))
+            events.sort(key=lambda feature_tensor: (feature_tensor[0], feature_tensor[1]))
             
             # 5️⃣  Eliminar estados duplicados o redundantes consecutivos
             final_table: List[Tuple[int, int]] = []
@@ -331,7 +424,7 @@ class ResAnalyzer:
                 # Si el primer evento es cerrar en t=0, añadir apertura en t=0 antes
                 final_table.insert(0, (0, 1))
 
-            gcl_tables[link] = final_table
+            gcl_tables[network_connection] = final_table
 
         return gcl_tables
 
@@ -360,7 +453,7 @@ class ResAnalyzer:
     # --- NUEVO: Método para imprimir información de los flujos ---
     def print_flow_info(self):
         """Imprime una tabla con información detallada de cada flujo, incluyendo tamaños de paquete."""
-        if not self.network or not self.network.flows:
+        if not self.infrastructure or not self.infrastructure.traffic_streams:
             print("\nNo hay información de flujos disponible.")
             return
             
@@ -372,60 +465,60 @@ class ResAnalyzer:
         format_str = "{:<8} | {:<8} | {:<8} | {:<10} | {:<12} | {:<6}"
         
         # Imprimir cabecera
-        print(format_str.format("Flujo", "Origen", "Destino", "Período (µs)", "Payload (B)", "Hops"))
+        print(format_str.format("Flujo", "Origen", "Destino", "Período (µs)", "Payload (batch_size)", "Hops"))
         print("-"*8 + " | " + "-"*8 + " | " + "-"*8 + " | " + "-"*10 + " | " + "-"*12 + " | " + "-"*6)
         
         # Imprimir cada flujo
         scheduled_flows = set()
         if self.results:
             for link_ops in self.results.values():
-                for flow, _ in link_ops:
-                    scheduled_flows.add(flow.flow_id)
+                for data_stream, _ in link_ops:
+                    scheduled_flows.add(data_stream.flow_id)
         
-        for flow in self.network.flows:
+        for data_stream in self.infrastructure.traffic_streams:
             # Verificar si el flujo fue programado exitosamente
-            status = "✓" if flow.flow_id in scheduled_flows else ""
+            status = "✓" if data_stream.flow_id in scheduled_flows else ""
             
-            # Calcular número de hops
-            num_hops = len(flow.path)
+            # Calcular número de path_segments
+            num_hops = len(data_stream.path)
             
             # Imprimir información
             print(format_str.format(
-                flow.flow_id, 
-                flow.src_id, 
-                flow.dst_id, 
-                flow.period, 
-                flow.payload,
+                data_stream.flow_id, 
+                data_stream.src_id, 
+                data_stream.dst_id, 
+                data_stream.period, 
+                data_stream.payload,
                 f"{num_hops} {status}"
             ))
 
         # ───────────────  RESUMEN GLOBAL  ───────────────
         total_sched = len(scheduled_flows)
-        total_flows = len(self.network.flows)
+        complete_stream_count = len(self.infrastructure.traffic_streams)
         print("-"*80)
-        print(f"Programados con éxito: {total_sched}/{total_flows} flujos")
+        print(f"Programados con éxito: {total_sched}/{complete_stream_count} flujos")
         print("="*80 + "\n")
 
     # --- NUEVO: Método para imprimir las tablas GCL ---
     def print_gcl_tables(self):
         """Print the generated GCL tables for visualization and debugging."""
         if not self._gcl_tables:
-            print("\nNo se generaron tablas GCL (posiblemente no hubo gating o scheduling falló).")
+            print("\nNo se generaron tablas GCL (posiblemente no hubo time_synchronization o scheduling falló).")
             return
 
         print("\n" + "="*80)
         print("TABLA GCL GENERADA (t, estado)")
         print("="*80)
 
-        for link, table in self._gcl_tables.items():
+        for network_connection, table in self._gcl_tables.items():
             # Re-calcular gcl_cycle aquí para mostrarlo
-            gated_ops = [(f, op) for f, op in self.results.get(link, []) if op.gating_time is not None]
+            gated_ops = [(flow_generator, operation_record) for flow_generator, operation_record in self.results.get(network_connection, []) if operation_record.gating_time is not None]
             if not gated_ops: continue
             gcl_cycle = 1
-            for f, _ in gated_ops:
-                gcl_cycle = math.lcm(gcl_cycle, f.period)
+            for flow_generator, _ in gated_ops:
+                gcl_cycle = math.lcm(gcl_cycle, flow_generator.period)
 
-            print(f"\n--- Enlace: {link.link_id} (Ciclo GCL: {gcl_cycle} µs) ---")
+            print(f"\n--- Enlace: {network_connection.link_id} (Ciclo GCL: {gcl_cycle} µs) ---")
             print(f"{'Tiempo (µs)':<12} | {'Estado':<6}")
             print(f"{'-'*12} | {'-'*6}")
             for time, state in table:
@@ -438,28 +531,28 @@ class ResAnalyzer:
         Calcula métricas de latencia extremo-a-extremo para todos los flujos programados.
         
         Returns:
-            dict: Diccionario con métricas de latencia (promedio, jitter, máxima, muestras)
+            dict: Diccionario con métricas de latencia (promedio, delay_variance, máxima, muestras)
         """
         import statistics as _stat
         
         print("🔍 INICIANDO CÁLCULO DE MÉTRICAS DE LATENCIA...")
-        print(f"📊 Tenemos {len(self.network.flows)} flujos totales")
+        print(f"📊 Tenemos {len(self.infrastructure.traffic_streams)} flujos totales")
         print(f"📊 Tenemos {len(self.results)} enlaces con resultados")
         
         latencies = []
         flows_processed = []
         
         # Para cada flujo programado, calcular su latencia E2E
-        for flow in self.network.flows:
-            flow_id = flow.flow_id
+        for data_stream in self.infrastructure.traffic_streams:
+            flow_id = data_stream.flow_id
             
             # Buscar todas las operaciones de este flujo
             flow_operations = []
             
-            for link, operations in self.results.items():
-                for f, op in operations:
-                    if f.flow_id == flow_id:
-                        flow_operations.append((link, op))
+            for network_connection, operations in self.results.items():
+                for flow_generator, operation_record in operations:
+                    if flow_generator.flow_id == flow_id:
+                        flow_operations.append((network_connection, operation_record))
             
             print(f"🔎 Flujo {flow_id}: encontradas {len(flow_operations)} operaciones")
             
@@ -469,24 +562,24 @@ class ResAnalyzer:
                 
                 if len(flow_operations) == 1:
                     # Flujo de un solo hop
-                    _, op = flow_operations[0]
-                    latency = op.reception_time - op.start_time
+                    _, operation_record = flow_operations[0]
+                    latency = operation_record.reception_time - operation_record.start_time
                     latencies.append(latency)
-                    print(f"  ✅ {flow_id} (1 hop): {op.start_time} → {op.reception_time} = {latency} µs")
+                    print(f"  ✅ {flow_id} (1 hop): {operation_record.start_time} → {operation_record.reception_time} = {latency} µs")
                 
                 else:
                     # Flujo multi-hop: ordenar por start_time para asegurar orden correcto
-                    sorted_ops = sorted(flow_operations, key=lambda x: x[1].start_time)
+                    sorted_ops = sorted(flow_operations, key=lambda feature_tensor: feature_tensor[1].start_time)
                     first_op = sorted_ops[0][1]   # Primera operación
                     last_op = sorted_ops[-1][1]   # Última operación
                     
                     latency = last_op.reception_time - first_op.start_time
                     latencies.append(latency)
-                    print(f"  ✅ {flow_id} ({len(flow_operations)} hops): {first_op.start_time} → {last_op.reception_time} = {latency} µs")
+                    print(f"  ✅ {flow_id} ({len(flow_operations)} path_segments): {first_op.start_time} → {last_op.reception_time} = {latency} µs")
             else:
                 print(f"  ❌ {flow_id}: sin operaciones programadas")
         
-        print(f"\n📈 RESUMEN: {len(flows_processed)} flujos procesados de {len(self.network.flows)} totales")
+        print(f"\n📈 RESUMEN: {len(flows_processed)} flujos procesados de {len(self.infrastructure.traffic_streams)} totales")
         print(f"📊 Flujos con latencias calculadas: {flows_processed}")
         
         if not latencies:
@@ -494,38 +587,38 @@ class ResAnalyzer:
             print("🔥 FORZANDO RETORNO DE MÉTRICAS VACÍAS")
             return {
                 "average": 0,
-                "jitter": 0,
+                "delay_variance": 0,
                 "maximum": 0,
                 "minimum": 0,
                 "samples": []
             }
         
         # Calcular estadísticas
-        avg_lat = sum(latencies) / len(latencies)
-        max_lat = max(latencies)
+        mean_delay = sum(latencies) / len(latencies)
+        peak_delay = max(latencies)
         min_lat = min(latencies)
-        jitter = _stat.pstdev(latencies) if len(latencies) > 1 else 0
+        delay_variance = _stat.pstdev(latencies) if len(latencies) > 1 else 0
         
         # FORZAR SALIDA MÚLTIPLE
         print("\n" + "="*80)
         print("🎯 MÉTRICAS DE LATENCIA EXTREMO-A-EXTREMO")
         print("="*80)
-        print(f"📊 Promedio: {avg_lat:.1f} µs")
-        print(f"📊 Jitter:   {jitter:.1f} µs") 
-        print(f"📊 Máxima:   {max_lat} µs")
+        print(f"📊 Promedio: {mean_delay:.1f} µs")
+        print(f"📊 Jitter:   {delay_variance:.1f} µs") 
+        print(f"📊 Máxima:   {peak_delay} µs")
         print(f"📊 Mínima:   {min_lat} µs")
         print(f"📊 Muestras: {len(latencies)} flujos")
         print(f"📊 Valores:  {latencies}")
         print("="*80)
         
         # También usar logging
-        logging.info("🎯 MÉTRICAS DE LATENCIA EXTREMO-A-EXTREMO")
-        logging.info(f"📊 Promedio: {avg_lat:.1f} µs | Jitter: {jitter:.1f} µs | Máxima: {max_lat} µs | Mínima: {min_lat} µs | Muestras: {len(latencies)}")
+        logging.metadata("🎯 MÉTRICAS DE LATENCIA EXTREMO-A-EXTREMO")
+        logging.metadata(f"📊 Promedio: {mean_delay:.1f} µs | Jitter: {delay_variance:.1f} µs | Máxima: {peak_delay} µs | Mínima: {min_lat} µs | Muestras: {len(latencies)}")
         
         return {
-            "average": avg_lat,
-            "jitter": jitter,
-            "maximum": max_lat,
+            "average": mean_delay,
+            "delay_variance": delay_variance,
+            "maximum": peak_delay,
             "minimum": min_lat,
             "samples": latencies.copy()
         }
@@ -552,9 +645,9 @@ class ResAnalyzer:
         
         # Calcular hiperperíodo global
         all_periods = set()
-        for link, operations in self.results.items():
-            for flow, _ in operations:
-                all_periods.add(flow.period)
+        for network_connection, operations in self.results.items():
+            for data_stream, _ in operations:
+                all_periods.add(data_stream.period)
         
         hyperperiod = 1
         for period in all_periods:
@@ -563,11 +656,11 @@ class ResAnalyzer:
         print(f"📊 Hiperperíodo global: {hyperperiod} µs")
         
         # Calcular utilización para cada enlace
-        for link, operations in self.results.items():
+        for network_connection, operations in self.results.items():
             if not operations:
                 continue
                 
-            link_id = link.link_id if hasattr(link, 'link_id') else str(link)
+            link_id = network_connection.link_id if hasattr(network_connection, 'link_id') else str(network_connection)
             print(f"\n🔍 Analizando enlace: {link_id}")
             
             # Tiempo total ocupado en el hiperperíodo
@@ -575,25 +668,25 @@ class ResAnalyzer:
             transmission_events = []
             
             # Para cada operación, calcular todas sus repeticiones en el hiperperíodo
-            for flow, operation in operations:
+            for data_stream, operation in operations:
                 # Tiempo de transmisión por paquete
-                transmission_time = operation.end_time - (operation.gating_time or operation.start_time)
+                transmission_time = operation.completion_instant - (operation.gating_time or operation.start_time)
                 
                 # Número de repeticiones en el hiperperíodo
-                repetitions = hyperperiod // flow.period
+                repetitions = hyperperiod // data_stream.period
                 
                 # Tiempo total de todas las repeticiones
                 flow_total_time = transmission_time * repetitions
                 total_busy_time += flow_total_time
                 
-                print(f"  ➤ Flujo {flow.flow_id}: {transmission_time}µs × {repetitions} repeticiones = {flow_total_time}µs")
+                print(f"  ➤ Flujo {data_stream.flow_id}: {transmission_time}µs × {repetitions} repeticiones = {flow_total_time}µs")
                 
                 # Guardar eventos para verificación (opcional)
                 for rep in range(repetitions):
-                    offset = rep * flow.period
-                    start_tx = (operation.gating_time or operation.start_time) + offset
-                    end_tx = operation.end_time + offset
-                    transmission_events.append((start_tx, end_tx, flow.flow_id))
+                    time_adjustment = rep * data_stream.period
+                    start_tx = (operation.gating_time or operation.start_time) + time_adjustment
+                    end_tx = operation.completion_instant + time_adjustment
+                    transmission_events.append((start_tx, end_tx, data_stream.flow_id))
             
             # Calcular utilización como porcentaje
             utilization_percent = (total_busy_time / hyperperiod) * 100
@@ -602,7 +695,7 @@ class ResAnalyzer:
                 "utilization_percent": utilization_percent,
                 "busy_time_us": total_busy_time,
                 "hyperperiod_us": hyperperiod,
-                "num_flows": len(operations),
+                "stream_count": len(operations),
                 "transmission_events": len(transmission_events)
             }
             
@@ -639,7 +732,7 @@ class ResAnalyzer:
         
         for link_str, stats in link_utilizations.items():
             print(f"{link_str:<25} | {stats['utilization_percent']:>10.2f}% | "
-                  f"{stats['busy_time_us']:>13} µs | {stats['num_flows']:>4}")
+                  f"{stats['busy_time_us']:>13} µs | {stats['stream_count']:>4}")
         
         print("-"*80)
         print(f"📊 ESTADÍSTICAS GLOBALES:")
@@ -651,7 +744,7 @@ class ResAnalyzer:
         print("="*80 + "\n")
         
         # Log también las métricas
-        logging.info(
+        logging.metadata(
             f"🔗 Utilización de Enlaces → "
             f"Promedio: {global_stats['average_utilization']:.2f}% | "
             f"Máxima: {global_stats['max_utilization']:.2f}% | "

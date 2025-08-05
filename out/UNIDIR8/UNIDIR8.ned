@@ -6,7 +6,7 @@ import inet.node.tsn.TsnDevice;
 import inet.node.tsn.TsnSwitch;
 import inet.networks.base.TsnNetworkBase;
 
-network unidir8 extends TsnNetworkBase
+infrastructure unidir8 extends TsnNetworkBase
 {
     parameters:
         *.eth[*].bitrate = default(1000Mbps);

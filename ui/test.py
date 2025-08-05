@@ -7,15 +7,17 @@ import multiprocessing              # núcleos
 import matplotlib.pyplot as plt     # 🔹 para la gráfica
 import numpy as np                  # 🔹
 import math                         # 🔹
-from core.network.net import Net    # 🔹 muestreador oficial
 
 # Configure Qt to use offscreen rendering by default
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+# Añadir el directorio raíz al path ANTES de importar core
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Importar configuración de logging
+import tools.log_config  # Esto configura automáticamente logging.metadata
 
-# Añadir el directorio raíz al path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core.network.net import Net    # 🔹 muestreador oficial
 
 from tools.execute import execute_from_command_line
 from core.network.net import generate_flows, generate_graph, Network
@@ -25,7 +27,7 @@ from core.omnet_export import export_omnet_files                    # ← NUEVO
 
 DEFAULT_MIN_PAYLOAD = 64   # Valor por defecto mínimo razonable
 DEFAULT_MAX_PAYLOAD = 1518 # Valor por defecto máximo MTU
-DEFAULT_MAX_JITTER  = 0    # ← NUEVO: por defecto sin jitter
+DEFAULT_MAX_JITTER  = 0    # ← NUEVO: por defecto sin delay_variance
 
 # ╔═══════════════════════════════════════════════════════════════════╗
 #  HELPERS – gaps reales y gráfica de verificación                   #
@@ -42,12 +44,12 @@ def _extract_packet_gaps(schedule_res) -> list[int]:
     paquetes cuyo primer hop sale de una End-Station.
     """
     starts = []
-    for link, ops in schedule_res.items():
-        src = link.link_id[0] if isinstance(link.link_id, tuple) else link.link_id.split("-")[0]
-        if not _is_es(src):
+    for network_connection, ops in schedule_res.items():
+        source_node = network_connection.link_id[0] if isinstance(network_connection.link_id, tuple) else network_connection.link_id.split("-")[0]
+        if not _is_es(source_node):
             continue
-        for _flow, op in ops:
-            starts.append(op.start_time)          # primer hop ⇒ start_time
+        for _flow, operation_record in ops:
+            starts.append(operation_record.start_time)          # primer hop ⇒ start_time
 
     starts.sort()
     return [s2 - s1 for s1, s2 in zip(starts, starts[1:])]
@@ -113,7 +115,7 @@ def _plot_gap_distribution(
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
-    logging.info(f"[test] Gráfico de distribución guardado en → {out_path}")
+    logging.metadata(f"[test] Gráfico de distribución guardado en → {out_path}")
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +128,7 @@ def get_best_model_file(topo, alg='MaskablePPO'):
     from tools.definitions import OUT_DIR
     return os.path.join(OUT_DIR, f"best_model_{topo}_{alg}", "best_model.zip")
 
-def test(topo: str, num_flows: int, num_envs: int = 0,
+def test(topo: str, stream_count: int, num_envs: int = 0,
          best_model_path: str = None, alg: str = 'MaskablePPO', link_rate: int = 100,
          min_payload: int = DEFAULT_MIN_PAYLOAD, max_payload: int = DEFAULT_MAX_PAYLOAD,
          visualize: bool = True, show_log: bool = True,
@@ -134,41 +136,41 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
     
     # Para la prueba / inferencia forzamos **un solo entorno**
     num_envs = 1
-    logging.info("Usando 1 entorno (modo inferencia)")
+    logging.metadata("Usando 1 entorno (modo inferencia)")
     
     # Configurar logging: INFO para consola, DEBUG para archivo
     from tools.log_config import log_config
     from tools.definitions import OUT_DIR
-    log_config(os.path.join(OUT_DIR, f'test_{topo}_{num_flows}.log'), level=logging.INFO)
+    log_config(os.path.join(OUT_DIR, f'test_{topo}_{stream_count}.log'), level=logging.INFO)
 
     # Siempre usar la ruta predeterminada para la topología y algoritmo
     if best_model_path is None:
         best_model_path = get_best_model_file(topo, alg)
-        logging.info(f"Usando modelo predeterminado: {best_model_path}")
+        logging.metadata(f"Usando modelo predeterminado: {best_model_path}")
     
     # Verificar si el archivo existe
     if not os.path.exists(best_model_path):
         logging.error(f"Error: Modelo no encontrado: {best_model_path}")
         return False
 
-    graph = generate_graph(topo, link_rate)
+    network_structure = generate_graph(topo, link_rate)
 
     # Generar flujos usando el rango de payload especificado
-    flows = generate_flows(                       # ← SIN jitter
-        graph, num_flows,
+    traffic_streams = generate_flows(                       # ← SIN delay_variance
+        network_structure, stream_count,
         unidirectional=topo.startswith("UNIDIR"),
         min_payload=min_payload,
         max_payload=max_payload
     )
     
-    # Debug info: mostrar número de flujos generados
-    logging.info(f"Generados {len(flows)} flujos para topología {topo} (solicitados: {num_flows})")
+    # Debug metadata: mostrar número de flujos generados
+    logging.metadata(f"Generados {len(traffic_streams)} flujos para topología {topo} (solicitados: {stream_count})")
     
-    # Create network with ALL flows - no curriculum learning in test mode
-    network = Network(graph, flows)
+    # Create infrastructure with ALL traffic_streams - no curriculum learning in test mode
+    infrastructure = Network(network_structure, traffic_streams)
     
     # Always use DrlScheduler with explicitly disabled curriculum learning
-    scheduler = DrlScheduler(network, num_envs=num_envs, use_curriculum=False)
+    scheduler = DrlScheduler(infrastructure, num_envs=num_envs, use_curriculum=False)
     
     if best_model_path:
         scheduler.load_model(best_model_path, alg)
@@ -179,18 +181,18 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
     scheduled_cnt = 0
     if schedule_res:
         scheduled_cnt = {
-            f.flow_id
+            flow_generator.flow_id
             for link_ops in schedule_res.values()
-            for f, _ in link_ops
+            for flow_generator, _ in link_ops
         }.__len__()
 
-    logging.info(f"Flujos programados: {scheduled_cnt} de {num_flows} solicitados")
-    is_scheduled = (scheduled_cnt == num_flows)
+    logging.metadata(f"Flujos programados: {scheduled_cnt} de {stream_count} solicitados")
+    is_scheduled = (scheduled_cnt == stream_count)
     
     # a partir de aquí usa `schedule_res` (si existe) independientemente
     if schedule_res:
         # Analizar y guardar logs detallados del scheduling
-        analyzer = ResAnalyzer(network, schedule_res)
+        analyzer = ResAnalyzer(infrastructure, schedule_res)
         
         # Apply custom GCL threshold if provided
         if gcl_threshold != 30:  # If different from default
@@ -199,7 +201,7 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
         
         log_file = f'schedule_res_by_link_{analyzer.analyzer_id}.log'  # Usar el ID almacenado en el analizador
         log_path = os.path.join(OUT_DIR, log_file)
-        logging.info(f"Schedule details saved to {log_path}")
+        logging.metadata(f"Schedule details saved to {log_path}")
 
         # Imprimir información de flujos y tablas GCL estáticas
         analyzer.print_flow_info()  # Mostrar tabla de flujos independientemente
@@ -274,31 +276,31 @@ def test(topo: str, num_flows: int, num_envs: int = 0,
             # Try to visualize with error handling
             try:
                 # Visualizar la programación usando Plotly (más estable)
-                save_path = os.path.join(OUT_DIR, f'tsn_schedule_{topo}_{num_flows}.html')
+                save_path = os.path.join(OUT_DIR, f'tsn_schedule_{topo}_{stream_count}.html')
                 visualize_tsn_schedule_plotly(schedule_res, save_path)
                 
-                logging.info(f"Visualización interactiva guardada en {save_path}")
+                logging.metadata(f"Visualización interactiva guardada en {save_path}")
             except Exception as e:
                 logging.error(f"Error durante la visualización: {e}")
-                logging.info("Continuando sin visualización interactiva.")
+                logging.metadata("Continuando sin visualización interactiva.")
 
         # ────────────────────────────────────────────────────────────────
         #  NUEVO: exportar .ned y .ini cada vez que haya scheduling OK
         # ────────────────────────────────────────────────────────────────
         try:
             ned_path, ini_path = export_omnet_files(
-                network,
+                infrastructure,
                 schedule_res,
                 analyzer._gcl_tables,
                 topo,
                 OUT_DIR
             )
-            logging.info(f"OMNeT++ files escritos:\n  • {ned_path}\n  • {ini_path}")
+            logging.metadata(f"OMNeT++ files escritos:\n  • {ned_path}\n  • {ini_path}")
 
             # ──────────────────────────────────────────────────────────────
             #  RESUMEN GLOBAL DE FLOWS — última línea del log
             # ──────────────────────────────────────────────────────────────
-            logging.info(f"Programados con éxito: {scheduled_cnt}/{num_flows} flujos")
+            logging.metadata(f"Programados con éxito: {scheduled_cnt}/{stream_count} flujos")
 
         except Exception as e:
             logging.error(f"Error exportando ficheros OMNeT++: {e}")
@@ -313,13 +315,13 @@ if __name__ == '__main__':
     # «resolve» evita choques de nombres si algún módulo añade flags
     parser = argparse.ArgumentParser(conflict_handler="resolve")
     parser.add_argument('--topo', type=str, required=True)
-    parser.add_argument('--num_flows', type=int, required=True)
+    parser.add_argument('--stream_count', type=int, required=True)
     parser.add_argument('--alg', type=str, default='MaskablePPO')
     parser.add_argument('--link_rate', type=int, default=100)
     # Añadir argumentos para min/max payload
     parser.add_argument('--min-payload', type=int, default=DEFAULT_MIN_PAYLOAD, help=f"Tamaño mínimo de payload en bytes (default: {DEFAULT_MIN_PAYLOAD})")
     parser.add_argument('--max-payload', type=int, default=DEFAULT_MAX_PAYLOAD, help=f"Tamaño máximo de payload en bytes (default: {DEFAULT_MAX_PAYLOAD})")
-    # ── parámetro eliminado: max-jitter ya no existe ──
+    # ── parámetro eliminado: max-delay_variance ya no existe ──
     # ───────── NUEVA interfaz unificada ─────────
     parser.add_argument('--dist', type=str, default='fixed',
                         choices=['fixed', 'uniform', 'exponential', 'gaussian', 'pareto'],
@@ -360,7 +362,7 @@ if __name__ == '__main__':
     # ----------------------------------------------------------------- #
 
     # La función test ahora determinará automáticamente la ruta del modelo y usará el rango de payload
-    test(args.topo, args.num_flows, 0,
+    test(args.topo, args.stream_count, 0,
          None, args.alg, args.link_rate, 
          min_payload=args.min_payload, max_payload=args.max_payload,
          visualize=args.visualize, show_log=args.show_log,

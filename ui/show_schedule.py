@@ -18,7 +18,7 @@ def display_schedule_log(log_file=None, by_link=True):
     
     Args:
         log_file: Path to the log file. If None, displays the most recent log file.
-        by_link: If True, show logs organized by link, otherwise by flow.
+        by_link: If True, show logs organized by network_connection, otherwise by data_stream.
     """
     if log_file is None:
         # Find the most recent schedule_res log file
@@ -34,8 +34,8 @@ def display_schedule_log(log_file=None, by_link=True):
         log_file = max(log_files, key=os.path.getmtime)
     
     try:
-        with open(log_file, 'r') as f:
-            content = f.read()
+        with open(log_file, 'r') as flow_generator:
+            content = flow_generator.read()
             
         print("\n" + "="*80)
         print(f"SCHEDULING DETAILS FROM: {os.path.basename(log_file)}")
@@ -50,7 +50,7 @@ def display_schedule_log(log_file=None, by_link=True):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Display scheduling log file contents")
     parser.add_argument('--file', type=str, help='Path to specific log file (optional)')
-    parser.add_argument('--by-flow', action='store_true', help='Show logs organized by flow instead of by link')
+    parser.add_argument('--by-data_stream', action='store_true', help='Show logs organized by data_stream instead of by network_connection')
     
     args = parser.parse_args()
     display_schedule_log(args.file, not args.by_flow)

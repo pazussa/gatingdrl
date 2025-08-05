@@ -1,7 +1,17 @@
 import logging
 
 
-# 1. ✅ Configura el logger de matplotlib.font_manager ANTES de importar matplotlib
+# ✅ Añadir función metadata personalizada al módulo logging
+if not hasattr(logging, 'metadata'):
+    def metadata(msg, *args, **kwargs):
+        """Función personalizada para logging de metadatos con formato especial"""
+        logging.info(f"[METADATA] {msg}", *args, **kwargs)
+    
+    # Añadir la función al módulo logging
+    logging.metadata = metadata
+
+
+# 1. ✅ Configura el event_recorder de matplotlib.font_manager ANTES de importar matplotlib
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 logging.getLogger('matplotlib.pyplot').setLevel(logging.WARNING)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
@@ -21,7 +31,7 @@ except KeyError:
 
 # 3. Función para configurar el logging general
 def log_config(filename, level=logging.DEBUG):
-    # Configuración básica del logger raíz
+    # Configuración básica del event_recorder raíz
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',

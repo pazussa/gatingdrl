@@ -20,45 +20,45 @@ from core.network.net import Net, Network, generate_flows, generate_simple_topol
 #  Definiciones de error                                                      #
 # --------------------------------------------------------------------------- #
 class ErrorType(Enum):
-    PeriodExceed = auto()
+    DEADLINE_VIOLATION = auto()
 
 class SchedulingError(Exception):
-    def __init__(self, error_type: ErrorType, msg: str):
-        super().__init__(f"Error: {msg}")
-        self.error_type = error_type
-        self.msg = msg
+    def __init__(self, failure_category: ErrorType, error_message: str):
+        super().__init__(f"Error: {error_message}")
+        self.failure_category = failure_category
+        self.error_message = error_message
 
 # Funciones auxiliares para NetEnv
-def find_next_event_time(link_busy_until, switch_busy_until, current_time):
-    """Encuentra el siguiente tiempo de evento programado después de current_time"""
-    next_event_time = float('inf')
+def find_next_event_time(connection_free_time, node_free_time, system_clock):
+    """Encuentra el siguiente tiempo de evento programado después de system_clock"""
+    upcoming_event = float('inf')
     
     # Buscar en todos los tiempos de ocupación de enlaces
-    for time in link_busy_until.values():
-        if time > current_time and time < next_event_time:
-            next_event_time = time
+    for time in connection_free_time.values():
+        if time > system_clock and time < upcoming_event:
+            upcoming_event = time
             
     # Buscar en todos los tiempos de ocupación de switches
-    for time in switch_busy_until.values():
-        if time > current_time and time < next_event_time:
-            next_event_time = time
+    for time in node_free_time.values():
+        if time > system_clock and time < upcoming_event:
+            upcoming_event = time
     
-    return next_event_time if next_event_time < float('inf') else None
+    return upcoming_event if upcoming_event < float('inf') else None
 
-def check_valid_link(link, operation, current_flow, links_operations):
+def check_valid_link(network_connection, operation, current_flow, connection_activities):
     """Comprueba si una operación es válida en un enlace"""
-    for f_rhs, op_rhs in links_operations[link]:
-        offset = check_operation_isolation(
+    for f_rhs, op_rhs in connection_activities[network_connection]:
+        time_adjustment = check_operation_isolation(
             (operation, current_flow.period), (op_rhs, f_rhs.period)
         )
-        if offset is not None:
-            return offset
+        if time_adjustment is not None:
+            return time_adjustment
     return None
 
-def check_temp_operations(temp_operations, links_operations, current_flow):
+def check_temp_operations(provisional_activities, connection_activities, current_flow):
     """Verifica todas las operaciones temporales"""
-    for link, op in temp_operations:
-        offset = check_valid_link(link, op, current_flow, links_operations)
-        if offset is not None:
-            return offset
+    for network_connection, operation_record in provisional_activities:
+        time_adjustment = check_valid_link(network_connection, operation_record, current_flow, connection_activities)
+        if time_adjustment is not None:
+            return time_adjustment
     return None

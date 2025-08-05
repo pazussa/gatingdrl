@@ -19,18 +19,18 @@ def load_metrics(json_path=None):
     """Carga métricas de un archivo .json de entrenamiento"""
     if json_path is None:
         # Buscar el último archivo metrics.json
-        metrics_files = [f for f in os.listdir(OUT_DIR) if f.startswith('training_metrics_') and f.endswith('.json')]
+        metrics_files = [flow_generator for flow_generator in os.listdir(OUT_DIR) if flow_generator.startswith('training_metrics_') and flow_generator.endswith('.json')]
         if not metrics_files:
             print("No se encontraron archivos de métricas de entrenamiento")
             return None
         
         # Ordenar por fecha de modificación y usar el más reciente
-        metrics_files.sort(key=lambda x: os.path.getmtime(os.path.join(OUT_DIR, x)), reverse=True)
+        metrics_files.sort(key=lambda feature_tensor: os.path.getmtime(os.path.join(OUT_DIR, feature_tensor)), reverse=True)
         json_path = os.path.join(OUT_DIR, metrics_files[0])
     
     try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
+        with open(json_path, 'r') as flow_generator:
+            data = json.load(flow_generator)
         return data
     except Exception as e:
         print(f"Error cargando métricas: {e}")
@@ -127,16 +127,16 @@ def analyze_action_distribution(metrics, save_dir=None):
     n_rows = (n_actions + n_cols - 1) // n_cols
     
     action_names = {
-        "offset": "Offset temporal (µs)",
-        "gcl_strategy": "Estrategia GCL",
-        "guard_factor": "Guard factor",
+        "time_adjustment": "Offset temporal (µs)",
+        "scheduling_policy": "Estrategia GCL",
+        "protection_multiplier": "Guard factor",
         "priority": "Prioridad",
-        "switch_gap": "Gap mínimo",
-        "jitter": "Control jitter"
+        "inter_packet_spacing": "Gap mínimo",
+        "delay_variance": "Control delay_variance"
     }
     
-    for i, (action, dist) in enumerate(action_data.items()):
-        plt.subplot(n_rows, n_cols, i+1)
+    for iterator, (command, dist) in enumerate(action_data.items()):
+        plt.subplot(n_rows, n_cols, iterator+1)
         
         # Extraer valores y frecuencias
         values = sorted(map(int, dist.keys()))
@@ -146,7 +146,7 @@ def analyze_action_distribution(metrics, save_dir=None):
         total = sum(counts)
         if total > 0:
             probs = [count/total for count in counts]
-            entropy = -sum(p * np.log2(p) for p in probs if p > 0)
+            entropy = -sum(probability * np.log2(probability) for probability in probs if probability > 0)
             max_entropy = np.log2(len(values)) if len(values) > 0 else 0
             norm_entropy = entropy / max_entropy if max_entropy > 0 else 0
             entropy_str = f"Entropía: {norm_entropy:.2f}"
@@ -166,7 +166,7 @@ def analyze_action_distribution(metrics, save_dir=None):
         
         # Crear gráfico
         plt.bar(values, counts)
-        plt.title(f"{action_names.get(action, action)}\n{entropy_str}\n{analysis}")
+        plt.title(f"{action_names.get(command, command)}\n{entropy_str}\n{analysis}")
         plt.xlabel("Valor")
         plt.ylabel("Frecuencia")
         plt.grid(True, alpha=0.3)

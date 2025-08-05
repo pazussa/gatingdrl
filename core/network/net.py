@@ -7,7 +7,7 @@ import typing
 
 
 # Conjunto de períodos disponibles
-PERIOD_SET = [1000]
+PERIOD_SET = [2000, 4000, 8000]
 
 class Net:
     # Configuración de red y temporizaciones
@@ -145,7 +145,7 @@ class Flow:
         return isinstance(other, Flow) and self.flow_id == other.flow_id
 
     def __repr__(self):
-        return f"Flow(id='{self.flow_id}', src='{self.src_id}', dst='{self.dst_id}', period={self.period})"
+        return f"Flow(id='{self.flow_id}', source_node='{self.src_id}', destination_node='{self.dst_id}', period={self.period})"
 
 # Funciones para generar topologías simplificadas
 def generate_graph(topo, link_rate=100):
@@ -196,29 +196,29 @@ def generate_simple_topology(link_rate: int = 100):
     evita las múltiples llamadas a ``split('-')`` y simplifica las
     comprobaciones de si un nodo es *switch* o *end-station*.
     """
-    graph = nx.DiGraph()
-    graph.add_node("S1", node_type="SW")
+    network_structure = nx.DiGraph()
+    network_structure.add_node("S1", node_type="SW")
 
     for node in ("C1", "C2", "SRV1"):
-        graph.add_node(node, node_type="ES")
-        # Enlaces bidireccionales (src, dst)
-        graph.add_edge(node, "S1", link_id=(node, "S1"), link_rate=link_rate)
-        graph.add_edge("S1", node, link_id=("S1", node), link_rate=link_rate)
+        network_structure.add_node(node, node_type="ES")
+        # Enlaces bidireccionales (source_node, destination_node)
+        network_structure.add_edge(node, "S1", link_id=(node, "S1"), link_rate=link_rate)
+        network_structure.add_edge("S1", node, link_id=("S1", node), link_rate=link_rate)
 
-    return graph
+    return network_structure
 
 def generate_unidirectional_topology(link_rate=100):
     """Genera una topología unidireccional donde los datos fluyen solo de clientes a servidor"""
-    graph = nx.DiGraph()
+    network_structure = nx.DiGraph()
     # Crear nodos
-    graph.add_node("S1", node_type="SW")
+    network_structure.add_node("S1", node_type="SW")
     for node in ["C1", "C2", "SRV1"]:
-        graph.add_node(node, node_type="ES")
+        network_structure.add_node(node, node_type="ES")
     # Crear enlaces unidireccionales
     for client in ["C1", "C2"]:
-        graph.add_edge(client, "S1", link_id=(client, "S1"), link_rate=link_rate)
-    graph.add_edge("S1", "SRV1", link_id=("S1", "SRV1"), link_rate=link_rate)
-    return graph
+        network_structure.add_edge(client, "S1", link_id=(client, "S1"), link_rate=link_rate)
+    network_structure.add_edge("S1", "SRV1", link_id=("S1", "SRV1"), link_rate=link_rate)
+    return network_structure
 
 def generate_unidirectional_chain_topology(num_switches: int = 2,
                                            link_rate: int = 100):
@@ -229,29 +229,29 @@ def generate_unidirectional_chain_topology(num_switches: int = 2,
     Los nodos cliente se asignan automáticamente según la convención
     C1, C2, ..., Cn.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # Agregar nodos de switch
-    for i in range(1, num_switches + 1):
-        g.add_node(f"S{i}", node_type="SW")
+    for iterator in range(1, num_switches + 1):
+        network_graph.add_node(f"S{iterator}", node_type="SW")
 
     # Nodo servidor
-    g.add_node("SRV1", node_type="ES")
+    network_graph.add_node("SRV1", node_type="ES")
 
     # Clientes y enlaces cliente → switch
-    for i in range(1, num_switches + 1):
-        cli = f"C{i}"
-        g.add_node(cli, node_type="ES")                  # ← ¡aquí el fix!
-        g.add_edge(cli, f"S{i}", link_id=(cli, f"S{i}"), link_rate=link_rate)
+    for iterator in range(1, num_switches + 1):
+        cli = f"C{iterator}"
+        network_graph.add_node(cli, node_type="ES")                  # ← ¡aquí el fix!
+        network_graph.add_edge(cli, f"S{iterator}", link_id=(cli, f"S{iterator}"), link_rate=link_rate)
 
     # Enlaces entre switches
-    for i in range(1, num_switches):
-        g.add_edge(f"S{i}", f"S{i+1}", link_id=(f"S{i}", f"S{i+1}"), link_rate=link_rate)
+    for iterator in range(1, num_switches):
+        network_graph.add_edge(f"S{iterator}", f"S{iterator+1}", link_id=(f"S{iterator}", f"S{iterator+1}"), link_rate=link_rate)
 
     # Enlace del último switch al servidor
-    g.add_edge(f"S{num_switches}", "SRV1", link_id=(f"S{num_switches}", "SRV1"), link_rate=link_rate)
+    network_graph.add_edge(f"S{num_switches}", "SRV1", link_id=(f"S{num_switches}", "SRV1"), link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # Helper functions to maintain backward compatibility
 def generate_unidirectional_chain_topology2(link_rate=100):
@@ -270,25 +270,25 @@ def generate_unidirectional_topology4(link_rate=100):
     Topología de dos switches en cascada (Edge → Aggregation) con
     cuatro clientes y un servidor.  Todo el tráfico fluye **hacia SRV1**.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # switches
-    g.add_node("S1", node_type="SW")
-    g.add_node("S2", node_type="SW")
+    network_graph.add_node("S1", node_type="SW")
+    network_graph.add_node("S2", node_type="SW")
 
     # end-stations
     for c in ["C1", "C2", "C3", "C4", "SRV1"]:
-        g.add_node(c, node_type="ES")
+        network_graph.add_node(c, node_type="ES")
 
     # enlaces cliente → edge-switch
     for c in ["C1", "C2", "C3", "C4"]:
-        g.add_edge(c, "S1", link_id=(c, "S1"), link_rate=link_rate)
+        network_graph.add_edge(c, "S1", link_id=(c, "S1"), link_rate=link_rate)
 
     # backbone unidireccional
-    g.add_edge("S1", "S2",     link_id=("S1", "S2"),     link_rate=link_rate)
-    g.add_edge("S2", "SRV1",   link_id=("S2", "SRV1"),   link_rate=link_rate)
+    network_graph.add_edge("S1", "S2",     link_id=("S1", "S2"),     link_rate=link_rate)
+    network_graph.add_edge("S2", "SRV1",   link_id=("S2", "SRV1"),   link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # ╔═══════════════════════════════════════════════════════════════════╗
 # ║  NUEVA  TOPOLOGÍA  –  UNIDIR5                                     ║
@@ -302,40 +302,40 @@ def generate_unidirectional_topology5(link_rate=100):
     Tres switches en línea (S1→S2→S3) simulando el *spine* de un pequeño
     anillo industrial.  Seis clientes repartidos, todos dirigidos a SRV1.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # switches
     for sw in ["S1", "S2", "S3"]:
-        g.add_node(sw, node_type="SW")
+        network_graph.add_node(sw, node_type="SW")
 
     # end-stations
     for es in ["C1", "C2", "C3", "C4", "C5", "C6", "SRV1"]:
-        g.add_node(es, node_type="ES")
+        network_graph.add_node(es, node_type="ES")
 
     # clientes → switches locales
     for c in ["C1", "C2"]:
-        g.add_edge(c, "S1", link_id=(c, "S1"), link_rate=link_rate)
+        network_graph.add_edge(c, "S1", link_id=(c, "S1"), link_rate=link_rate)
     for c in ["C3", "C4"]:
-        g.add_edge(c, "S2", link_id=(c, "S2"), link_rate=link_rate)
+        network_graph.add_edge(c, "S2", link_id=(c, "S2"), link_rate=link_rate)
     for c in ["C5", "C6"]:
-        g.add_edge(c, "S3", link_id=(c, "S3"), link_rate=link_rate)
+        network_graph.add_edge(c, "S3", link_id=(c, "S3"), link_rate=link_rate)
 
     # backbone lineal
-    g.add_edge("S1", "S2",   link_id=("S1", "S2"),   link_rate=link_rate)
-    g.add_edge("S2", "S3",   link_id=("S2", "S3"),   link_rate=link_rate)
-    g.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
+    network_graph.add_edge("S1", "S2",   link_id=("S1", "S2"),   link_rate=link_rate)
+    network_graph.add_edge("S2", "S3",   link_id=("S2", "S3"),   link_rate=link_rate)
+    network_graph.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # ────────────────────────────────────────────────────────────────────
 #  NUEVAS TOPOLOGÍAS UNIDIR 6-8
 # ────────────────────────────────────────────────────────────────────
 
-def _add_es(graph, node_list, sw_name, link_rate):
+def _add_es(network_structure, vertex_catalog, sw_name, link_rate):
     """Helper: añade ES→switch unidireccional."""
-    for n in node_list:
-        graph.add_node(n, node_type="ES")
-        graph.add_edge(n, sw_name, link_id=(n, sw_name), link_rate=link_rate)
+    for n in vertex_catalog:
+        network_structure.add_node(n, node_type="ES")
+        network_structure.add_edge(n, sw_name, link_id=(n, sw_name), link_rate=link_rate)
 
 
 def generate_unidirectional_topology6(link_rate=100):
@@ -344,23 +344,23 @@ def generate_unidirectional_topology6(link_rate=100):
     C1,C2→S1 → S2 → SRV1  
     C3,C4 conectan a S2; C5,C6 a S3.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
     # Switches
     for s in ("S1", "S2", "S3"):
-        g.add_node(s, node_type="SW")
+        network_graph.add_node(s, node_type="SW")
     # Server
-    g.add_node("SRV1", node_type="ES")
+    network_graph.add_node("SRV1", node_type="ES")
 
     # End-stations
-    _add_es(g, ("C1", "C2"), "S1", link_rate)
-    _add_es(g, ("C3", "C4"), "S2", link_rate)
-    _add_es(g, ("C5", "C6"), "S3", link_rate)
+    _add_es(network_graph, ("C1", "C2"), "S1", link_rate)
+    _add_es(network_graph, ("C3", "C4"), "S2", link_rate)
+    _add_es(network_graph, ("C5", "C6"), "S3", link_rate)
 
     # Backbone line
-    g.add_edge("S1", "S2", link_id=("S1", "S2"), link_rate=link_rate)
-    g.add_edge("S2", "S3", link_id=("S2", "S3"), link_rate=link_rate)
-    g.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
-    return g
+    network_graph.add_edge("S1", "S2", link_id=("S1", "S2"), link_rate=link_rate)
+    network_graph.add_edge("S2", "S3", link_id=("S2", "S3"), link_rate=link_rate)
+    network_graph.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
+    return network_graph
 
 
 def generate_unidirectional_topology7(link_rate=100):
@@ -368,20 +368,20 @@ def generate_unidirectional_topology7(link_rate=100):
     UNIDIR7 – 'star-of-switches'  
     Tres leaf-switches (S1-S3) con 2 clientes cada uno → core S0 → SRV1.
     """
-    g = nx.DiGraph()
-    g.add_node("S0", node_type="SW")   # Core
+    network_graph = nx.DiGraph()
+    network_graph.add_node("S0", node_type="SW")   # Core
     for s in ("S1", "S2", "S3"):
-        g.add_node(s, node_type="SW")
-    g.add_node("SRV1", node_type="ES")
+        network_graph.add_node(s, node_type="SW")
+    network_graph.add_node("SRV1", node_type="ES")
 
-    _add_es(g, ("C1", "C2"), "S1", link_rate)
-    _add_es(g, ("C3", "C4"), "S2", link_rate)
-    _add_es(g, ("C5", "C6"), "S3", link_rate)
+    _add_es(network_graph, ("C1", "C2"), "S1", link_rate)
+    _add_es(network_graph, ("C3", "C4"), "S2", link_rate)
+    _add_es(network_graph, ("C5", "C6"), "S3", link_rate)
 
     for leaf in ("S1", "S2", "S3"):
-        g.add_edge(leaf, "S0", link_id=(leaf, "S0"), link_rate=link_rate)
-    g.add_edge("S0", "SRV1", link_id=("S0", "SRV1"), link_rate=link_rate)
-    return g
+        network_graph.add_edge(leaf, "S0", link_id=(leaf, "S0"), link_rate=link_rate)
+    network_graph.add_edge("S0", "SRV1", link_id=("S0", "SRV1"), link_rate=link_rate)
+    return network_graph
 
 
 def generate_unidirectional_topology8(link_rate=100):
@@ -389,23 +389,23 @@ def generate_unidirectional_topology8(link_rate=100):
     UNIDIR8 – spine/leaf simplificado (2 niveles)  
     4 leafs con 2 clientes cada uno → agg S5 → core S6 → SRV1.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
     # Switches
     for s in ("S1", "S2", "S3", "S4", "S5", "S6"):
-        g.add_node(s, node_type="SW")
-    g.add_node("SRV1", node_type="ES")
+        network_graph.add_node(s, node_type="SW")
+    network_graph.add_node("SRV1", node_type="ES")
 
     # Leafs
-    _add_es(g, ("C1", "C2"), "S1", link_rate)
-    _add_es(g, ("C3", "C4"), "S2", link_rate)
-    _add_es(g, ("C5", "C6"), "S3", link_rate)
-    _add_es(g, ("C7", "C8"), "S4", link_rate)
+    _add_es(network_graph, ("C1", "C2"), "S1", link_rate)
+    _add_es(network_graph, ("C3", "C4"), "S2", link_rate)
+    _add_es(network_graph, ("C5", "C6"), "S3", link_rate)
+    _add_es(network_graph, ("C7", "C8"), "S4", link_rate)
 
     for leaf in ("S1", "S2", "S3", "S4"):
-        g.add_edge(leaf, "S5", link_id=(leaf, "S5"), link_rate=link_rate)
-    g.add_edge("S5", "S6", link_id=("S5", "S6"), link_rate=link_rate)
-    g.add_edge("S6", "SRV1", link_id=("S6", "SRV1"), link_rate=link_rate)
-    return g
+        network_graph.add_edge(leaf, "S5", link_id=(leaf, "S5"), link_rate=link_rate)
+    network_graph.add_edge("S5", "S6", link_id=("S5", "S6"), link_rate=link_rate)
+    network_graph.add_edge("S6", "SRV1", link_id=("S6", "SRV1"), link_rate=link_rate)
+    return network_graph
 
 # ─────────────────────────────────────────────────────────────────────────
 #  NUEVAS TOPOLOGÍAS
@@ -413,58 +413,58 @@ def generate_unidirectional_topology8(link_rate=100):
 
 def generate_unidirectional_topology9(link_rate=100):
     """Estrella clásica: S1 como hub central."""
-    g = nx.DiGraph()
-    g.add_node("S1", node_type="SW")
-    _add_es(g, [f"C{i}" for i in range(1, 7)], "S1", link_rate)
-    g.add_node("SRV1", node_type="ES")
-    g.add_edge("S1", "SRV1", link_id=("S1", "SRV1"), link_rate=link_rate)
-    return g
+    network_graph = nx.DiGraph()
+    network_graph.add_node("S1", node_type="SW")
+    _add_es(network_graph, [f"C{iterator}" for iterator in range(1, 7)], "S1", link_rate)
+    network_graph.add_node("SRV1", node_type="ES")
+    network_graph.add_edge("S1", "SRV1", link_id=("S1", "SRV1"), link_rate=link_rate)
+    return network_graph
 
 def generate_unidirectional_topology10(link_rate=100):
     """Anillo de 3 switches – todos los ES envían a SRV1."""
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
     for sw in ("S1", "S2", "S3"):
-        g.add_node(sw, node_type="SW")
+        network_graph.add_node(sw, node_type="SW")
     # anillo unidireccional (S1→S2→S3→S1)
-    g.add_edge("S1", "S2", link_id=("S1", "S2"), link_rate=link_rate)
-    g.add_edge("S2", "S3", link_id=("S2", "S3"), link_rate=link_rate)
-    g.add_edge("S3", "S1", link_id=("S3", "S1"), link_rate=link_rate)
+    network_graph.add_edge("S1", "S2", link_id=("S1", "S2"), link_rate=link_rate)
+    network_graph.add_edge("S2", "S3", link_id=("S2", "S3"), link_rate=link_rate)
+    network_graph.add_edge("S3", "S1", link_id=("S3", "S1"), link_rate=link_rate)
     # clientes
-    _add_es(g, ["C1"], "S1", link_rate)
-    _add_es(g, ["C2"], "S2", link_rate)
-    _add_es(g, ["C3"], "S3", link_rate)
+    _add_es(network_graph, ["C1"], "S1", link_rate)
+    _add_es(network_graph, ["C2"], "S2", link_rate)
+    _add_es(network_graph, ["C3"], "S3", link_rate)
     # servidor accesible desde cualquier switch
-    g.add_node("SRV1", node_type="ES")
+    network_graph.add_node("SRV1", node_type="ES")
     for sw in ("S1", "S2", "S3"):
-        g.add_edge(sw, "SRV1", link_id=(sw, "SRV1"), link_rate=link_rate)
-    return g
+        network_graph.add_edge(sw, "SRV1", link_id=(sw, "SRV1"), link_rate=link_rate)
+    return network_graph
 
 def generate_unidirectional_topology11(link_rate=100):
     """Core-Aggregation-Edge con 8 ES – prueba multi-nivel."""
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
     # core
-    g.add_node("S0", node_type="SW")
+    network_graph.add_node("S0", node_type="SW")
     # aggregation
     for aggr in ("S1", "S2"):
-        g.add_node(aggr, node_type="SW")
-        g.add_edge(aggr, "S0", link_id=(aggr, "S0"), link_rate=link_rate)
+        network_graph.add_node(aggr, node_type="SW")
+        network_graph.add_edge(aggr, "S0", link_id=(aggr, "S0"), link_rate=link_rate)
     # edge
     edge_map = {"S1": ("S3", "S4"), "S2": ("S5", "S6")}
     for aggr, edges in edge_map.items():
         for esw in edges:
-            g.add_node(esw, node_type="SW")
-            g.add_edge(esw, aggr, link_id=(esw, aggr), link_rate=link_rate)
+            network_graph.add_node(esw, node_type="SW")
+            network_graph.add_edge(esw, aggr, link_id=(esw, aggr), link_rate=link_rate)
     # end-stations under edge switches
     client_map = {
         "S3": ("C1", "C2"), "S4": ("C3", "C4"),
         "S5": ("C5", "C6"), "S6": ("C7", "C8"),
     }
     for esw, cls in client_map.items():
-        _add_es(g, cls, esw, link_rate)
+        _add_es(network_graph, cls, esw, link_rate)
     # server
-    g.add_node("SRV1", node_type="ES")
-    g.add_edge("S0", "SRV1", link_id=("S0", "SRV1"), link_rate=link_rate)
-    return g
+    network_graph.add_node("SRV1", node_type="ES")
+    network_graph.add_edge("S0", "SRV1", link_id=("S0", "SRV1"), link_rate=link_rate)
+    return network_graph
 
 # ────────────────────────────────────────────────────────────────────────
 #  UNIDIR-12  →  grafo completo (7 nodos)
@@ -475,27 +475,27 @@ def generate_unidirectional_topology12(link_rate=100):
     Grafo *todos-con-todos*: dos switches + 4 clientes + 1 servidor.
     Se generan enlaces **dirigidos** entre *cada* par de nodos distinto.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     switches = ["S1", "S2"]
-    clients  = [f"C{i}" for i in range(1, 5)]
+    clients  = [f"C{iterator}" for iterator in range(1, 5)]
     server   = ["SRV1"]
     all_nodes = switches + clients + server
 
     # anotar tipo de nodo
     for n in switches:
-        g.add_node(n, node_type="SW")
+        network_graph.add_node(n, node_type="SW")
     for n in clients + server:
-        g.add_node(n, node_type="ES")
+        network_graph.add_node(n, node_type="ES")
 
     # enlaces dirigidos entre cualquier par u ≠ v
     for u in all_nodes:
         for v in all_nodes:
             if u == v:
                 continue
-            g.add_edge(u, v, link_id=(u, v), link_rate=link_rate)
+            network_graph.add_edge(u, v, link_id=(u, v), link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # ──────────────────────────────────────────────────────────────────
 #  UNIDIR-13  ·  Cliente + anillo SW + 2 servidores
@@ -511,7 +511,7 @@ def generate_unidirectional_topology13(link_rate: int = 100):
 
     Todos los enlaces son **dirigidos** y de la misma velocidad.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # ── nodos ─────────────────────────────────────────────────────
     sw_nodes  = ["S1", "S2", "S3", "S4"]
@@ -519,23 +519,23 @@ def generate_unidirectional_topology13(link_rate: int = 100):
     srv_nodes = ["SRV1", "SRV2"]
 
     for n in sw_nodes:
-        g.add_node(n, node_type="SW")
+        network_graph.add_node(n, node_type="SW")
     for n in cli_nodes + srv_nodes:
-        g.add_node(n, node_type="ES")
+        network_graph.add_node(n, node_type="ES")
 
     # ── enlaces cliente→anillo ────────────────────────────────────
-    g.add_edge("C1", "S1", link_id=("C1", "S1"), link_rate=link_rate)
+    network_graph.add_edge("C1", "S1", link_id=("C1", "S1"), link_rate=link_rate)
 
     # ── anillo unidireccional S1→S2→S3→S4→S1 ─────────────────────
     ring = ["S1", "S2", "S3", "S4", "S1"]
     for u, v in zip(ring, ring[1:]):
-        g.add_edge(u, v, link_id=(u, v), link_rate=link_rate)
+        network_graph.add_edge(u, v, link_id=(u, v), link_rate=link_rate)
 
     # ── salidas a servidores ─────────────────────────────────────
-    g.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
-    g.add_edge("S1", "SRV2", link_id=("S1", "SRV2"), link_rate=link_rate)
+    network_graph.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
+    network_graph.add_edge("S1", "SRV2", link_id=("S1", "SRV2"), link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # ──────────────────────────────────────────────────────────────────────
 #  UNIDIR-14 :  «rueda» con hub central + anillo de 4 switches
@@ -558,37 +558,37 @@ def generate_unidirectional_topology14(link_rate=100):
         S1 → S2 → S3 → S4 → S1   (anillo horario)
         S4 → SRV1  (último salto al servidor)
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # Hub central
-    g.add_node("S0", node_type="SW")
+    network_graph.add_node("S0", node_type="SW")
 
     # Switches de borde en el anillo
     edge_sw = ["S1", "S2", "S3", "S4"]
     for sw in edge_sw:
-        g.add_node(sw, node_type="SW")
+        network_graph.add_node(sw, node_type="SW")
 
     # Enlaces del anillo (S1→S2→S3→S4→S1)
-    for i, src in enumerate(edge_sw):
-        dst = edge_sw[(i + 1) % len(edge_sw)]
-        g.add_edge(src, dst, link_id=(src, dst), link_rate=link_rate)
+    for iterator, source_node in enumerate(edge_sw):
+        destination_node = edge_sw[(iterator + 1) % len(edge_sw)]
+        network_graph.add_edge(source_node, destination_node, link_id=(source_node, destination_node), link_rate=link_rate)
 
     # Spokes (borde → hub) y regreso hub → S4 para llegar al servidor
     for sw in edge_sw:
-        g.add_edge(sw, "S0", link_id=(sw, "S0"), link_rate=link_rate)
-    g.add_edge("S0", "S4", link_id=("S0", "S4"), link_rate=link_rate)
+        network_graph.add_edge(sw, "S0", link_id=(sw, "S0"), link_rate=link_rate)
+    network_graph.add_edge("S0", "S4", link_id=("S0", "S4"), link_rate=link_rate)
 
     # Clientes
     clients = [("C1", "S1"), ("C2", "S2"), ("C3", "S3")]
     for c, sw in clients:
-        g.add_node(c, node_type="ES")
-        g.add_edge(c, sw, link_id=(c, sw), link_rate=link_rate)
+        network_graph.add_node(c, node_type="ES")
+        network_graph.add_edge(c, sw, link_id=(c, sw), link_rate=link_rate)
 
     # Servidor
-    g.add_node("SRV1", node_type="ES")
-    g.add_edge("S4", "SRV1", link_id=("S4", "SRV1"), link_rate=link_rate)
+    network_graph.add_node("SRV1", node_type="ES")
+    network_graph.add_edge("S4", "SRV1", link_id=("S4", "SRV1"), link_rate=link_rate)
 
-    return g
+    return network_graph
 
 # ──────────────────────────────────────────────────────────────────────
 #  UNIDIR-15 :  pentágono de 5 switches (S0-S4) con 3 clientes y 1 servidor
@@ -610,71 +610,71 @@ def generate_unidirectional_topology15(link_rate=100):
     por lo que cualquier paquete de un cliente alcanzará el servidor en S3
     después de recorrer parte del pentágono.
     """
-    g = nx.DiGraph()
+    network_graph = nx.DiGraph()
 
     # ----- switches S0-S4 -----
-    sw = [f"S{i}" for i in range(5)]
+    sw = [f"S{iterator}" for iterator in range(5)]
     for s in sw:
-        g.add_node(s, node_type="SW")
+        network_graph.add_node(s, node_type="SW")
 
     # pentágono dirigido (horario)
-    for i in range(5):
-        src = sw[i]
-        dst = sw[(i + 1) % 5]
-        g.add_edge(src, dst, link_id=(src, dst), link_rate=link_rate)
+    for iterator in range(5):
+        source_node = sw[iterator]
+        destination_node = sw[(iterator + 1) % 5]
+        network_graph.add_edge(source_node, destination_node, link_id=(source_node, destination_node), link_rate=link_rate)
 
     # ----- clientes -----
     clients = [("C1", "S0"), ("C2", "S1"), ("C3", "S2")]
     for c, s in clients:
-        g.add_node(c, node_type="ES")
-        g.add_edge(c, s, link_id=(c, s), link_rate=link_rate)
+        network_graph.add_node(c, node_type="ES")
+        network_graph.add_edge(c, s, link_id=(c, s), link_rate=link_rate)
 
     # ----- servidor -----
-    g.add_node("SRV1", node_type="ES")
-    g.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
+    network_graph.add_node("SRV1", node_type="ES")
+    network_graph.add_edge("S3", "SRV1", link_id=("S3", "SRV1"), link_rate=link_rate)
 
-    return g
+    return network_graph
 
-def _transform_line_graph(graph):
+def _transform_line_graph(network_structure):
     """Transforma un grafo en su línea de grafo y crea diccionario de enlaces"""
-    line_graph = nx.line_graph(graph)
-    links_dict = {node: Link(node, graph.edges[node]['link_rate']) for node in line_graph.nodes}
+    line_graph = nx.line_graph(network_structure)
+    links_dict = {node: Link(node, network_structure.edges[node]['link_rate']) for node in line_graph.nodes}
     return line_graph, links_dict
 
 class Network:
-    def __init__(self, graph, flows):
-        self.graph = graph
-        self.flows = flows
+    def __init__(self, network_structure, traffic_streams):
+        self.network_structure = network_structure
+        self.traffic_streams = traffic_streams
         # Construir línea de grafo y diccionario de enlaces
-        self.line_graph, self.links_dict = _transform_line_graph(graph)
+        self.line_graph, self.links_dict = _transform_line_graph(network_structure)
 
-    def disable_gcl(self, num_nodes):
+    def disable_gcl(self, vertex_count):
         """Deshabilita la capacidad GCL para un número específico de nodos"""
-        list_nodes = random.sample(list(self.graph.nodes), num_nodes)
+        list_nodes = random.sample(list(self.network_structure.nodes), vertex_count)
         list_links = []
         for node in list_nodes:
-            list_links.extend([link for link in self.links_dict.values() if node == link.link_id[0]])
-        for link in list_links:
-            link.gcl_capacity = 0
+            list_links.extend([network_connection for network_connection in self.links_dict.values() if node == network_connection.link_id[0]])
+        for network_connection in list_links:
+            network_connection.gcl_capacity = 0
 
     def set_gcl(self, num_gcl):
         """Establece la capacidad GCL para todos los enlaces"""
-        for link in self.links_dict.values():
-            link.gcl_capacity = num_gcl
+        for network_connection in self.links_dict.values():
+            network_connection.gcl_capacity = num_gcl
 
 class FlowGenerator:
-    def __init__(self, graph, seed=None, period_set=None, min_payload=1500, max_payload=1518): # Añadir min/max payload
-        self.graph = graph
+    def __init__(self, network_structure, random_state=None, period_set=None, min_payload=1500, max_payload=1518): # Añadir min/max payload
+        self.network_structure = network_structure
         # Inicializar semilla para reproducibilidad
-        if seed is not None:
-            random.seed(seed)
+        if random_state is not None:
+            random.random_state(random_state)
         # Inicializar conjunto de períodos usando el global PERIOD_SET como default
         self.period_set = period_set if period_set is not None else PERIOD_SET
         for period in self.period_set:
             assert isinstance(period, int) and period > 0
         # Jitters eliminado
         # Identificar nodos finales
-        self.es_nodes = [n for n, d in graph.nodes(data=True) if d['node_type'] == 'ES']
+        self.es_nodes = [n for n, d in network_structure.nodes(data=True) if d['node_type'] == 'ES']
         self.num_generated_flows = 0
         # Guardar rango de payload
         self.min_payload = min_payload
@@ -686,23 +686,23 @@ class FlowGenerator:
         # Seleccionar dos nodos aleatorios
         src_id, dst_id = random.sample(self.es_nodes, 2)
         # Calcular ruta más corta
-        path = nx.shortest_path(self.graph, src_id, dst_id)
-        path = [(path[i], path[i+1]) for i in range(len(path)-1)]
+        path = nx.shortest_path(self.network_structure, src_id, dst_id)
+        path = [(path[iterator], path[iterator+1]) for iterator in range(len(path)-1)]
         # Seleccionar período aleatorio
         period = random.choice(self.period_set)
 
         # Crear flujo con payload aleatorio dentro del rango especificado
-        flow = Flow(
+        data_stream = Flow(
             f"F{self.num_generated_flows}", src_id, dst_id, path,
             payload=random.randint(self.min_payload, self.max_payload), # Usar el rango
             period=period
         )
         self.num_generated_flows += 1
-        return flow
+        return data_stream
 
-    def __call__(self, num_flows=1):
+    def __call__(self, stream_count=1):
         """Genera un conjunto de flujos aleatorios"""
-        return [self._generate_flow() for _ in range(num_flows)]
+        return [self._generate_flow() for _ in range(stream_count)]
 
 class UniDirectionalFlowGenerator(FlowGenerator):
     def _generate_flow(self):
@@ -720,24 +720,24 @@ class UniDirectionalFlowGenerator(FlowGenerator):
         dst_id = random.choice(server_nodes)
         
         # Calcular ruta
-        path = nx.shortest_path(self.graph, src_id, dst_id)
-        path = [(path[i], path[i+1]) for i in range(len(path)-1)]
+        path = nx.shortest_path(self.network_structure, src_id, dst_id)
+        path = [(path[iterator], path[iterator+1]) for iterator in range(len(path)-1)]
         
         # Seleccionar parámetros
         period = random.choice(self.period_set)
         
         # Crear flujo con payload aleatorio dentro del rango especificado
-        flow = Flow(
+        data_stream = Flow(
             f"F{self.num_generated_flows}", src_id, dst_id, path,
             payload=random.randint(self.min_payload, self.max_payload), # Usar el rango
             period=period
         )
         self.num_generated_flows += 1
-        return flow
+        return data_stream
 
-def generate_flows(graph, num_flows=50, seed=None, period_set=PERIOD_SET, unidirectional=False, min_payload=1500, max_payload=1518): # Añadir min/max payload
+def generate_flows(network_structure, stream_count=50, random_state=None, period_set=PERIOD_SET, unidirectional=False, min_payload=1500, max_payload=1518): # Añadir min/max payload
     """Función para generar flujos con configuración específica"""
     generator_class = UniDirectionalFlowGenerator if unidirectional else FlowGenerator
     # Pasar el rango de payload al constructor del generador
-    generator = generator_class(graph, seed, period_set, min_payload, max_payload)
-    return generator(num_flows)
+    generator = generator_class(network_structure, random_state, period_set, min_payload, max_payload)
+    return generator(stream_count)

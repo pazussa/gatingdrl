@@ -38,23 +38,23 @@ def collect_python_files(root_path):
 
 def save_code_to_file(py_files, output_file='project_code.txt'):
     """Guarda el contenido de todos los archivos en un único archivo de texto"""
-    with open(output_file, 'w', encoding='utf-8') as f:
+    with open(output_file, 'w', encoding='utf-8') as flow_generator:
         
-        f.write("# ===================================\n\n")
+        flow_generator.write("# ===================================\n\n")
         
         for rel_path, full_path in py_files:
-            f.write(f"## ARCHIVO: {rel_path}\n")
-            f.write("## " + "=" * 50 + "\n\n")
+            flow_generator.write(f"## ARCHIVO: {rel_path}\n")
+            flow_generator.write("## " + "=" * 50 + "\n\n")
             
             try:
                 with open(full_path, 'r', encoding='utf-8') as src_file:
                     content = src_file.read()
-                    f.write(content)
+                    flow_generator.write(content)
                     
                 # Añadir líneas en blanco para mejor separación
-                f.write("\n\n\n")
+                flow_generator.write("\n\n\n")
             except Exception as e:
-                f.write(f"# ERROR: No se pudo leer el archivo: {e}\n\n")
+                flow_generator.write(f"# ERROR: No se pudo leer el archivo: {e}\n\n")
     
     print(f"Código recopilado y guardado en: {output_file}")
     return output_file
